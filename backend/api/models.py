@@ -1,6 +1,7 @@
 from django.db import models
 from django.contrib.auth.models import AbstractUser
 import uuid
+from pgvector.django import VectorField
 
 class User(AbstractUser):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
@@ -49,3 +50,15 @@ class StateData(models.Model):
     
     class Meta:
         db_table = 'state_data'
+
+class Document(models.Model):
+    content = models.TextField()  # Original text - needed to show context to LLM
+    embedding = VectorField(dimensions=768)  # Vector representation - needed for similarity search
+    metadata = models.JSONField(default=dict, blank=True)  # Optional: store source, category, etc.
+    created_at = models.DateTimeField(auto_now_add=True)
+    
+    class Meta:
+        db_table = 'documents'
+        indexes = [
+            models.Index(fields=['created_at']),
+        ]

@@ -10,6 +10,7 @@ from .models import StateData, Titanic, User, UserChat
 from django.views.decorators.csrf import csrf_exempt
 from django.utils.decorators import method_decorator
 from .gemini import process_user_query, summarize_text
+from .rag import rag_query
 from django.db import connection
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.authentication import TokenAuthentication
@@ -26,7 +27,7 @@ class ChatBotAPI(APIView):
             return Response({"answer": "Please ask a question"})
         
         try:
-            result = process_user_query(question)
+            result = rag_query(question)
             return Response({"answer": result})
             
         except Exception as e:
@@ -101,13 +102,10 @@ class GoogleAuthAPI(APIView):
         if not email:
             return Response({'error': 'Email is required'}, status=status.HTTP_400_BAD_REQUEST)
         
-        # Check if user exists
         try:
             user = User.objects.get(email=email)
         except User.DoesNotExist:
-            # Create new user
             username = email.split('@')[0]
-            # Ensure unique username
             counter = 1
             original_username = username
             while User.objects.filter(username=username).exists():
