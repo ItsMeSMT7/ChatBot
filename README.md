@@ -1,4 +1,4 @@
-# P Square Intelligent Chatbot
+# Intelligent Chatbot
 
 An intelligent chatbot system that connects React frontend with Django backend, integrated with Gemini AI and PostgreSQL database.
 
