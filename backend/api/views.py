@@ -131,55 +131,128 @@ class GoogleAuthAPI(APIView):
         })
 
 @method_decorator(csrf_exempt, name='dispatch')
+
+@method_decorator(csrf_exempt, name='dispatch')
 class UserChatsAPI(APIView):
     authentication_classes = [TokenAuthentication]
     permission_classes = [IsAuthenticated]
-    
+
     def get(self, request):
         chats = UserChat.objects.filter(user=request.user)
-        return Response([{
-            'id': str(chat.id),
-            'title': chat.title,
-            'messages': chat.messages
-        } for chat in chats])
-    
+        return Response([
+            {
+                'id': str(chat.id),
+                'title': chat.title,
+                'messages': chat.messages
+            } for chat in chats
+        ])
+
     def post(self, request):
-        title = request.data.get('title')
+        title = request.data.get('title', 'New Chat')
         messages = request.data.get('messages', [])
-        
+
         chat = UserChat.objects.create(
             user=request.user,
             title=title,
             messages=messages
         )
-        
+
         return Response({
             'id': str(chat.id),
             'title': chat.title,
             'messages': chat.messages
         })
-    
+
     def put(self, request):
         chat_id = request.data.get('chat_id')
         messages = request.data.get('messages')
-        
+
+        if not chat_id:
+            return Response(
+                {'error': 'Chat ID is required'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
         try:
             chat = UserChat.objects.get(id=chat_id, user=request.user)
             chat.messages = messages
             chat.save()
             return Response({'success': True})
         except UserChat.DoesNotExist:
-            return Response({'error': 'Chat not found'}, status=status.HTTP_404_NOT_FOUND)
-    
+            return Response(
+                {'error': 'Chat not found'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
     def delete(self, request):
         chat_id = request.data.get('chat_id') or request.GET.get('chat_id')
-        
+
         if not chat_id:
-            return Response({'error': 'Chat ID is required'}, status=status.HTTP_400_BAD_REQUEST)
-        
+            return Response(
+                {'error': 'Chat ID is required'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
         try:
             chat = UserChat.objects.get(id=chat_id, user=request.user)
             chat.delete()
             return Response({'success': True})
         except UserChat.DoesNotExist:
-            return Response({'error': 'Chat not found'}, status=status.HTTP_404_NOT_FOUND)
+            return Response(
+                {'error': 'Chat not found'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+
+# class UserChatsAPI(APIView):
+#     authentication_classes = [TokenAuthentication]
+#     permission_classes = [IsAuthenticated]
+    
+#     def get(self, request):
+#         chats = UserChat.objects.filter(user=request.user)
+#         return Response([{
+#             'id': str(chat.id),
+#             'title': chat.title,
+#             'messages': chat.messages
+#         } for chat in chats])
+    
+#     def post(self, request):
+#         title = request.data.get('title')
+#         messages = request.data.get('messages', [])
+        
+#         chat = UserChat.objects.create(
+#             user=request.user,
+#             title=title,
+#             messages=messages
+#         )
+        
+#         return Response({
+#             'id': str(chat.id),
+#             'title': chat.title,
+#             'messages': chat.messages
+#         })
+    
+#     def put(self, request):
+#         chat_id = request.data.get('chat_id')
+#         messages = request.data.get('messages')
+        
+#         try:
+#             chat = UserChat.objects.get(id=chat_id, user=request.user)
+#             chat.messages = messages
+#             chat.save()
+#             return Response({'success': True})
+#         except UserChat.DoesNotExist:
+#             return Response({'error': 'Chat not found'}, status=status.HTTP_404_NOT_FOUND)
+    
+#     def delete(self, request):
+#         chat_id = request.data.get('chat_id') or request.GET.get('chat_id')
+        
+#         if not chat_id:
+#             return Response({'error': 'Chat ID is required'}, status=status.HTTP_400_BAD_REQUEST)
+        
+#         try:
+#             chat = UserChat.objects.get(id=chat_id, user=request.user)
+#             chat.delete()
+#             return Response({'success': True})
+#         except UserChat.DoesNotExist:
+#             return Response({'error': 'Chat not found'}, status=status.HTTP_404_NOT_FOUND)

@@ -2,6 +2,7 @@ import requests
 import json
 
 OLLAMA_BASE_URL = "http://localhost:11434"
+LLM_MODEL = "gemma3:1b"  # MUST match an installed model (check with `ollama list`)
 
 def generate_embedding(text):
     """
@@ -15,7 +16,7 @@ def generate_embedding(text):
         response = requests.post(
             f"{OLLAMA_BASE_URL}/api/embeddings",
             json={
-                "model": "gemma:1b",
+                "model": "nomic-embed-text",
                 "prompt": text
             }
         )
@@ -33,12 +34,20 @@ def generate_response(prompt):
         response = requests.post(
             f"{OLLAMA_BASE_URL}/api/generate",
             json={
-                "model": "gemma:1b",
+                "model": LLM_MODEL,
                 "prompt": prompt,
                 "stream": False
             }
         )
         response.raise_for_status()
         return response.json()["response"]
+    except requests.exceptions.HTTPError as http_err:
+        # Try to get more details from the response body for debugging
+        details = ""
+        try:
+            details = http_err.response.json()
+        except json.JSONDecodeError:
+            details = http_err.response.text
+        raise Exception(f"LLM generation failed: {http_err}. Details: {details}")
     except Exception as e:
         raise Exception(f"LLM generation failed: {str(e)}")

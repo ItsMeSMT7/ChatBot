@@ -1,161 +1,32 @@
-# P SQUARE INTELLIGENT CHATBOT - COMPLETE PROJECT DOCUMENTATION
+# P SQUARE - INTELLIGENT HYBRID RAG CHATBOT
 
 ## 📋 PROJECT OVERVIEW
 
-**Project Name:** P Square Intelligent Chatbot (Solven)  
-**Type:** Full-Stack AI-Powered Chatbot Application  
-**Purpose:** Natural language interface for querying PostgreSQL database using Google Gemini AI  
-**Status:** ✅ COMPLETED & FULLY FUNCTIONAL
+**Project Name:** P Square Intelligent Chatbot
+**Type:** Local Hybrid RAG (Retrieval-Augmented Generation) System
+**Purpose:** A privacy-focused chatbot that intelligently switches between querying structured SQL data and unstructured PDF documents using local AI.
+**Status:** ✅ COMPLETED & PRODUCTION READY
 
 ---
 
-## 🎯 WHAT IS COMPLETED
+## 🎯 KEY FEATURES
 
-### ✅ Backend (Django REST Framework)
-- [x] Django REST API with PostgreSQL integration
-- [x] Google Gemini AI integration for NLP
-- [x] User authentication system (Token-based)
-- [x] Google OAuth integration
-- [x] Chat history management
-- [x] SQL query generation from natural language
-- [x] Database models for User, UserChat, StateData, Titanic
-- [x] CORS configuration for frontend communication
-- [x] Environment variable management
-- [x] API endpoints for all operations
+### 1. Hybrid Intelligence
+The system automatically classifies user intent to choose the best data source:
+- **Structured Data (SQL):** Generates SQL queries for database questions (e.g., "How many passengers survived?").
+- **Unstructured Data (PDF):** Uses Vector Search for policy/document questions (e.g., "What is the vacation policy?").
+- **Conversational:** Handles greetings and general chit-chat.
 
-### ✅ Frontend (React.js)
-- [x] Modern glassmorphism UI design
-- [x] User authentication (Login/Signup)
-- [x] Google OAuth login
-- [x] Real-time chat interface
-- [x] Chat history sidebar
-- [x] Message persistence
-- [x] Responsive design
-- [x] Loading states and error handling
-- [x] Token-based authentication
-- [x] Protected routes
+### 2. Fully Local AI Stack
+- **No External APIs:** Runs entirely on your machine.
+- **LLM:** Uses **Ollama** running `gemma3:1b` for reasoning and generation.
+- **Embeddings:** Uses `nomic-embed-text` for high-quality vector representations.
+- **Privacy:** Zero data leakage to cloud providers.
 
-### ✅ Database (PostgreSQL)
-- [x] State data table (Indian states population & income)
-- [x] Titanic dataset table (passenger information)
-- [x] User management tables
-- [x] Chat history storage
-- [x] Database connection testing
-
-### ✅ AI Integration
-- [x] Google Gemini 2.5 Flash model integration
-- [x] Natural language to SQL conversion
-- [x] Intelligent response formatting
-- [x] Greeting and general conversation handling
-- [x] Context-aware query processing
-
-### ✅ DevOps & Automation
-- [x] Automated setup script (setup.bat)
-- [x] Application startup script (start_application.bat)
-- [x] Database testing utilities
-- [x] API testing scripts
-
----
-
-## 🏗️ COMPLETE FOLDER STRUCTURE
-
-```
-P Square/
-│
-├── backend/                          # Django Backend Application
-│   ├── api/                          # Main API Application
-│   │   ├── management/
-│   │   │   └── commands/
-│   │   │       ├── load_states.py    # Load state data into DB
-│   │   │       └── start_app.py      # Custom management command
-│   │   ├── migrations/               # Database migrations
-│   │   │   ├── 0001_initial.py
-│   │   │   └── 0002_titanic_user_alter_statedata_income_and_more.py
-│   │   ├── __init__.py
-│   │   ├── admin.py                  # Django admin configuration
-│   │   ├── apps.py                   # App configuration
-│   │   ├── gemini.py                 # ⭐ Gemini AI integration logic
-│   │   ├── models.py                 # ⭐ Database models (User, UserChat, Titanic, StateData)
-│   │   ├── serializers.py            # DRF serializers
-│   │   ├── tests.py                  # Unit tests
-│   │   ├── urls.py                   # ⭐ API URL routing
-│   │   └── views.py                  # ⭐ API views (ChatBot, Auth, UserChats)
-│   │
-│   ├── backend/                      # Django Project Settings
-│   │   ├── __init__.py
-│   │   ├── asgi.py                   # ASGI configuration
-│   │   ├── settings.py               # ⭐ Project settings (DB, CORS, Auth)
-│   │   ├── urls.py                   # Main URL configuration
-│   │   └── wsgi.py                   # WSGI configuration
-│   │
-│   ├── accounts/                     # Additional accounts app
-│   │   ├── migrations/
-│   │   ├── admin.py
-│   │   ├── models.py
-│   │   ├── urls.py
-│   │   └── views.py
-│   │
-│   ├── .env                          # ⭐ Environment variables (DB, API keys)
-│   ├── manage.py                     # Django management script
-│   ├── requirements.txt              # ⭐ Python dependencies
-│   ├── db.sqlite3                    # SQLite (not used, using PostgreSQL)
-│   ├── create_tables.sql             # SQL table creation scripts
-│   ├── setup_database.sql            # Database setup script
-│   ├── test_connection.py            # Database connection tester
-│   ├── test_gemini.py                # Gemini API tester
-│   ├── check_titanic.py              # Titanic data checker
-│   ├── list_models.py                # List Django models
-│   ├── view_users.py                 # View users utility
-│   └── start_chatbot.bat             # Backend startup script
-│
-├── frontend/                         # React Frontend Application
-│   ├── public/                       # Static public files
-│   │   ├── favicon.ico
-│   │   ├── index.html                # Main HTML template
-│   │   ├── logo192.png
-│   │   ├── logo512.png
-│   │   ├── manifest.json
-│   │   └── robots.txt
-│   │
-│   ├── src/                          # React source code
-│   │   ├── Components/               # React components
-│   │   │   ├── Auth.js               # ⭐ Authentication wrapper
-│   │   │   ├── Chatbot.js            # ⭐ Main chat interface
-│   │   │   ├── GoogleAuth.js         # Google OAuth component
-│   │   │   ├── HomeScreen.js         # Home screen component
-│   │   │   ├── LoginForm.js          # Login form
-│   │   │   ├── Sidebar.js            # ⭐ Chat history sidebar
-│   │   │   └── SignupForm.js         # Signup form
-│   │   │
-│   │   ├── services/
-│   │   │   └── authService.js        # ⭐ Authentication & API service
-│   │   │
-│   │   ├── App.css                   # ⭐ Main styling (glassmorphism)
-│   │   ├── App.js                    # ⭐ Main App component
-│   │   ├── App.test.js               # App tests
-│   │   ├── index.css                 # Global styles
-│   │   ├── index.js                  # React entry point
-│   │   ├── logo.svg
-│   │   ├── reportWebVitals.js
-│   │   └── setupTests.js
-│   │
-│   ├── .env                          # Frontend environment variables
-│   ├── .gitignore
-│   ├── package.json                  # ⭐ Node dependencies
-│   ├── package-lock.json
-│   └── README.md
-│
-├── README.md                         # ⭐ Main project documentation
-├── AUTHENTICATION_SETUP.md           # Authentication setup guide
-├── GOOGLE_OAUTH_SETUP.md             # Google OAuth setup guide
-├── setup.bat                         # ⭐ Automated setup script
-├── start_application.bat             # ⭐ Application startup script
-├── test_api.py                       # API testing script
-├── test_backend.bat                  # Backend testing script
-├── package.json                      # Root package.json
-└── package-lock.json
-
-```
+### 3. Advanced RAG Pipeline
+- **Ingestion:** Automated PDF text extraction, chunking, and embedding.
+- **Storage:** PostgreSQL with `pgvector` extension for efficient similarity search.
+- **Retrieval:** Cosine similarity search to find relevant document chunks.
 
 ---
 
@@ -167,63 +38,25 @@ P Square/
 | **Python** | 3.x | Backend programming language |
 | **Django** | 4.2.7 | Web framework |
 | **Django REST Framework** | 3.14.0 | RESTful API creation |
-| **PostgreSQL** | Latest | Primary database |
-| **psycopg2-binary** | 2.9.9 | PostgreSQL adapter |
-| **Google Generative AI** | 0.8.3 | Gemini AI integration |
-| **python-dotenv** | 1.0.0 | Environment variable management |
-| **django-cors-headers** | 4.3.1 | CORS handling |
+| **PostgreSQL** | Latest | Primary database with `pgvector` |
+| **Ollama** | Latest | Local AI Server |
+| **PyPDF2** | 3.0.1 | PDF Text Extraction |
 
 ### Frontend Technologies
 | Technology | Version | Purpose |
 |------------|---------|---------|
 | **React** | 19.2.3 | UI framework |
-| **React DOM** | 19.2.3 | React rendering |
 | **lucide-react** | 0.563.0 | Icon library |
-| **Bootstrap** | 5.3.8 | CSS framework |
-| **react-bootstrap** | 2.10.10 | Bootstrap React components |
 
-### AI & Database
-- **Google Gemini 2.5 Flash**: Natural language processing
-- **PostgreSQL**: Relational database
-- **Token Authentication**: Secure API access
+### AI Models (Local)
+- **Generation**: `gemma3:1b` (Google's lightweight open model)
+- **Embedding**: `nomic-embed-text` (768-dimensional vectors)
 
 ---
 
 ## 📊 DATABASE SCHEMA
 
-### 1. User Model (Custom User)
-```python
-class User(AbstractUser):
-    id = UUIDField (Primary Key)
-    email = EmailField (Unique)
-    username = CharField
-    password = CharField (Hashed)
-    profile_picture = URLField (Optional)
-    
-    USERNAME_FIELD = 'email'
-```
-
-### 2. UserChat Model
-```python
-class UserChat:
-    id = UUIDField (Primary Key)
-    user = ForeignKey(User)
-    title = CharField(max_length=200)
-    messages = JSONField (Array of message objects)
-    created_at = DateTimeField
-    updated_at = DateTimeField
-```
-
-### 3. StateData Model
-```python
-class StateData:
-    id = AutoField (Primary Key)
-    state = CharField(max_length=100)
-    population = IntegerField
-    income = DecimalField(max_digits=10, decimal_places=2)
-```
-
-### 4. Titanic Model
+### 1. Titanic Model (Structured Data)
 ```python
 class Titanic:
     passenger_id = IntegerField (Primary Key)
