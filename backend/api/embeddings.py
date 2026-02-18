@@ -1,7 +1,7 @@
 import requests
 
 OLLAMA_URL = "http://localhost:11434/api/embeddings"
-MODEL = "gemma:1b"
+MODEL = "llama3.2:1b"
 
 def generate_embedding(text):
     """
@@ -16,7 +16,7 @@ def generate_embedding(text):
     response = requests.post(
         OLLAMA_URL,
         json={
-            "model": MODEL,
+            "model": "gemma3:1b",
             "prompt": text
         }
     )

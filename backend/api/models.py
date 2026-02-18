@@ -6,6 +6,8 @@ from pgvector.django import VectorField
 class User(AbstractUser):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     email = models.EmailField(unique=True)
+    user_type = models.IntegerField(default=2, choices=((1, 'Admin'), (2, 'User')))
+    
     profile_picture = models.URLField(blank=True, null=True)
     
     USERNAME_FIELD = 'email'
@@ -52,13 +54,30 @@ class StateData(models.Model):
         db_table = 'state_data'
 
 class Document(models.Model):
-    content = models.TextField()  # Original text - needed to show context to LLM
-    embedding = VectorField(dimensions=768)  # Vector representation - needed for similarity search
-    metadata = models.JSONField(default=dict, blank=True)  # Optional: store source, category, etc.
-    created_at = models.DateTimeField(auto_now_add=True)
-    
+    name = models.CharField(max_length=255, null=True, blank=True)
+    file = models.FileField(upload_to='documents/', null=True, blank=True)
+    uploaded_at = models.DateTimeField(auto_now_add=True)
+    uploaded_by = models.ForeignKey(
+        User,
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True
+    )
+
+    def __str__(self):
+        return self.name or "Document"
+
     class Meta:
         db_table = 'documents'
         indexes = [
-            models.Index(fields=['created_at']),
+            models.Index(fields=['uploaded_at']),
         ]
+
+class DocumentChunk(models.Model):
+    document = models.ForeignKey(Document, on_delete=models.CASCADE, related_name='chunks', null=True, blank=True)
+    content = models.TextField()
+    embedding = VectorField(dimensions=768)
+    metadata = models.JSONField(default=dict)
+
+    class Meta:
+        db_table = 'document_chunks'

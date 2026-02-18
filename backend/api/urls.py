@@ -1,5 +1,6 @@
 from django.urls import path
 from .views import ChatBotAPI, SignupAPI, LoginAPI, GoogleAuthAPI, UserChatsAPI
+from . import views
 
 urlpatterns = [
     path('chat/', ChatBotAPI.as_view()),
@@ -7,4 +8,9 @@ urlpatterns = [
     path('login/', LoginAPI.as_view()),
     path('google-auth/', GoogleAuthAPI.as_view()),
     path('user-chats/', UserChatsAPI.as_view()),
+      # ⭐ Admin APIs
+    path('admin/stats/', views.admin_dashboard_stats, name='admin_stats'),
+    path('admin/documents/', views.admin_documents, name='admin_documents'),
+    path('admin/documents/<int:doc_id>/', views.admin_documents, name='admin_delete_document'),
+
 ]

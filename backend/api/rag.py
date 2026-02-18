@@ -3,23 +3,79 @@ from django.db import connection
 from api.ollama_service import generate_embedding, generate_response
 
 def similarity_search(query, top_k=3):
-    """Search similar documents using pgvector"""
+    """
+    Hybrid Search: Combines Vector Search (Semantic) + Keyword Search (Exact Match)
+    """
     query_embedding = generate_embedding(query)
     
+    # 1. Vector Search (Semantic)
     with connection.cursor() as cursor:
         cursor.execute("""
             SELECT content, metadata, (embedding <=> %s::vector) as distance
-            FROM documents
+            FROM document_chunks
             ORDER BY distance
             LIMIT %s
         """, [query_embedding, top_k])
-        
-        results = cursor.fetchall()
-    
-    return [{"content": row[0], "metadata": row[1], "distance": row[2]} for row in results]
+        vector_results = cursor.fetchall()
 
-def rag_query(question):
-    question_lower = question.lower()
+    # 2. Keyword Search (Exact Match using PostgreSQL Full-Text Search)
+    with connection.cursor() as cursor:
+        cursor.execute("""
+            SELECT content, metadata, 0.0 as distance
+            FROM document_chunks
+            WHERE to_tsvector('english', content) @@ plainto_tsquery('english', %s)
+            LIMIT %s
+        """, [query, top_k])
+        keyword_results = cursor.fetchall()
+    
+    # 3. Combine & Deduplicate
+    # We use a dictionary to merge results, preferring vector results (preserving distance)
+    combined_results = {}
+    
+    for row in vector_results:
+        combined_results[row[0]] = {"content": row[0], "metadata": row[1], "distance": row[2]}
+        
+    for row in keyword_results:
+        if row[0] not in combined_results:
+            # Assign 0.0 distance for exact keyword matches (high priority)
+            combined_results[row[0]] = {"content": row[0], "metadata": row[1], "distance": 0.0}
+            
+    # Convert back to list and sort by distance
+    final_results = list(combined_results.values())
+    final_results.sort(key=lambda x: x['distance'])
+    
+    return final_results[:top_k]
+
+def rag_query(question, chat_history=None):
+    # -------------------------
+    # 0️⃣ Contextualize Question (Memory)
+    # -------------------------
+    search_query = question
+    
+    if chat_history and len(chat_history) > 0:
+        # Format history for the LLM
+        history_text = "\n".join([f"{msg['role']}: {msg['content']}" for msg in chat_history[-4:]])
+        
+        rewrite_prompt = f"""
+Given the following conversation history and a follow-up question, rephrase the follow-up question to be a standalone question that can be understood without the history.
+
+Chat History:
+{history_text}
+
+Follow-up Question: {question}
+
+Standalone Question:
+"""
+        # Get the rewritten question
+        rewritten = generate_response(rewrite_prompt).strip()
+        # Basic cleanup if LLM is chatty
+        if "Standalone Question:" in rewritten:
+            rewritten = rewritten.split("Standalone Question:")[-1].strip()
+            
+        print(f"DEBUG: Original: '{question}' -> Rewritten: '{rewritten}'")
+        search_query = rewritten
+
+    question_lower = search_query.lower()
 
     # -------------------------
     # 1️⃣ Ask LLM to classify question
@@ -28,17 +84,17 @@ def rag_query(question):
 Classify the user's question into ONE of the following categories:
 - database: For questions about Titanic passengers, such as counts, details, ages, survival, fares, or lists (e.g., "show me details of women", "how many men").
 - knowledge: For questions about company policy, employment, leave, travel, office environment, or any specific terms defined in the documents.
-- conversational: ONLY for greetings (hello, hi) or questions that explicitly refer to previous chat history (e.g., "what about him?", "and for female?").
+- conversational: ONLY for greetings (hello, hi) or simple pleasantries.
 - irrelevant: For questions completely unrelated to the Titanic dataset or company policy.
  
 Return ONLY one word.
 
 Question:
-{question}
+{search_query}
 """
 
     question_type = generate_response(classification_prompt).strip().lower()
-    print(f"DEBUG: Question '{question}' classified as: {question_type}")
+    print(f"DEBUG: Question '{search_query}' classified as: {question_type}")
 
     # -------------------------
     # 2️⃣ If Database → Generate SQL
@@ -86,7 +142,7 @@ Examples:
   SQL Query: SELECT * FROM titanic WHERE sex = 'female' AND age BETWEEN 20 AND 50;
 
 User Question:
-{question}
+{search_query}
 
 SQL Query:
 """
@@ -127,7 +183,7 @@ SQL Query:
     # -------------------------
     if "knowledge" in question_type:
 
-        docs = similarity_search(question, top_k=5)
+        docs = similarity_search(search_query, top_k=5)
 
         if not docs:
             return "No relevant information found."
@@ -142,7 +198,7 @@ If the information is not in the context, state that the answer is not available
 {context}
 
 ### User's Question:
-{question}
+{search_query}
 
 ### Answer:
 """
@@ -150,7 +206,8 @@ If the information is not in the context, state that the answer is not available
         return generate_response(prompt)
 
     if "conversational" in question_type:
-        return "I understand you're asking a follow-up question. However, I process each question independently and cannot remember previous conversations or perform calculations based on them. Please ask a direct question about the data."
+        # Simple conversational response
+        return generate_response(f"Respond politely to this conversational input: {search_query}")
 
     # -------------------------
     # 4️⃣ Irrelevant

@@ -1,7 +1,7 @@
 import requests
 import json
 
-OLLAMA_BASE_URL = "http://localhost:11434"
+OLLAMA_BASE_URL = "http://localhost:11434" 
 LLM_MODEL = "gemma3:1b"  # MUST match an installed model (check with `ollama list`)
 
 def generate_embedding(text):
@@ -22,6 +22,10 @@ def generate_embedding(text):
         )
         response.raise_for_status()
         return response.json()["embedding"]
+    except requests.exceptions.HTTPError as e:
+        if e.response.status_code == 404:
+            raise Exception("Embedding model 'nomic-embed-text' not found. Please run: ollama pull nomic-embed-text")
+        raise Exception(f"Embedding generation failed: {str(e)}")
     except Exception as e:
         raise Exception(f"Embedding generation failed: {str(e)}")
 
@@ -48,6 +52,11 @@ def generate_response(prompt):
             details = http_err.response.json()
         except json.JSONDecodeError:
             details = http_err.response.text
+            
+        if http_err.response.status_code == 404:
+            if isinstance(details, dict) and "error" in details and "not found" in details["error"]:
+                raise Exception(f"Model '{LLM_MODEL}' not found. Please run this command in your terminal: ollama pull {LLM_MODEL}")
+                
         raise Exception(f"LLM generation failed: {http_err}. Details: {details}")
     except Exception as e:
         raise Exception(f"LLM generation failed: {str(e)}")

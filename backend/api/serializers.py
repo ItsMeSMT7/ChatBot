@@ -1,8 +1,16 @@
-from rest_framework import serializers #drf
-from .models import StateData
+from rest_framework import serializers
+from .models import StateData, User, Document, UserChat
 
+
+# Existing serializer (keep this)
 class StateDataSerializer(serializers.ModelSerializer):
-    #get all data using api
     class Meta:
         model = StateData
         fields = '__all__'
+
+
+# ⭐ ADD THIS (required for your views.py)
+class UserSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = User
+        fields = "__all__"
