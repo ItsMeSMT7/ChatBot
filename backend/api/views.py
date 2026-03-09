@@ -10,7 +10,7 @@ from .models import StateData, Titanic, User, UserChat
 from django.views.decorators.csrf import csrf_exempt
 from django.utils.decorators import method_decorator
 from .gemini import process_user_query, summarize_text
-from .rag import rag_query
+from .rag import run_solven_analytics_pipeline, rag_query
 from django.db import connection
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.authentication import TokenAuthentication
