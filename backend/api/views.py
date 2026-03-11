@@ -21,26 +21,43 @@ from .models import StateData, Titanic, User, UserChat, Document, DocumentChunk
 from .ollama_service import generate_embedding
 import os
 from django.conf import settings
+from .document_parser import parse_document
+from .chunking import create_chunks
+
 
 @method_decorator(csrf_exempt, name='dispatch')
 class ChatBotAPI(APIView):
     authentication_classes = [TokenAuthentication]
     permission_classes = [IsAuthenticated]
-    
+
     def post(self, request):
         question = request.data.get("question")
         chat_history = request.data.get("chat_history", [])
-        
+
         if not question:
             return Response({"answer": "Please ask a question"})
-        
+
         try:
             result = rag_query(question, chat_history)
-            return Response({"answer": result})
-            
-        except Exception as e:
-            return Response({"answer": f"Sorry, I couldn't process your question. Error: {str(e)}"})
 
+            # ── THIS IS THE KEY FIX ──
+            # rag_query() returns a STRING, not a dictionary
+            # So just use it directly:
+            if isinstance(result, dict):
+                answer = result.get("answer", str(result))
+            else:
+                answer = str(result)
+
+            return Response({"answer": answer})
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            return Response({
+                "answer": f"Sorry, I couldn't process your question. Error: {str(e)}"
+            })
+        
+        
 @method_decorator(csrf_exempt, name='dispatch')
 class SignupAPI(APIView):
     def post(self, request):
@@ -243,62 +260,104 @@ def admin_dashboard_stats(request):
 
 def process_and_embed_document(doc):
     """
-    Reads the file, chunks the text, generates embeddings, and saves to DocumentChunk.
-    """
-    try:
-        file_path = doc.file.path
-        text = ""
-        ext = os.path.splitext(file_path)[1].lower()
+    Process an uploaded document through the new intelligent pipeline.
 
-        # 1. Extract Text
-        if ext == '.pdf':
-            try:
-                from pypdf import PdfReader
-                reader = PdfReader(file_path)
-                for page in reader.pages:
-                    text += page.extract_text() + "\n"
-            except ImportError:
-                print("pypdf not installed. Skipping PDF content.")
-                return
-        elif ext in ['.txt', '.md', '.csv']:
-            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                text = f.read()
-        
-        if not text:
+    OLD FLOW:
+        read file → split every 500 chars → embed → save
+
+    NEW FLOW:
+        parse file (extract headings, pages) →
+        intelligent sentence-based chunking (respects headings) →
+        extract keywords per chunk →
+        embed each chunk →
+        save with rich metadata (page, section, keywords)
+    """
+    from .ollama_service import generate_embedding
+
+    try:
+        doc.processing_status = 'processing'
+        doc.save(update_fields=['processing_status'])
+
+        file_path = doc.file.path
+
+        # ── Step 1: Parse document ──────────────────────────
+        #    Extracts structured sections with headings + page numbers
+        parsed_doc = parse_document(file_path)
+
+        if not parsed_doc.full_text.strip():
+            doc.processing_status = 'failed'
+            doc.save(update_fields=['processing_status'])
+            print(f"No text extracted from {doc.name}")
             return
 
-        # 2. Chunk Text (Simple character split for now)
-        chunk_size = 500
-        chunks = [text[i:i+chunk_size] for i in range(0, len(text), chunk_size)]
+        # ── Step 2: Intelligent chunking ────────────────────
+        #    Sentence-aware, heading-aware, keyword-extracted
+        processed_chunks = create_chunks(parsed_doc)
 
-        # 3. Embed and Save
-        for chunk_content in chunks:
-            embedding = generate_embedding(chunk_content)
+        if not processed_chunks:
+            doc.processing_status = 'failed'
+            doc.save(update_fields=['processing_status'])
+            print(f"No chunks created from {doc.name}")
+            return
+
+        # ── Step 3: Delete old chunks (if re-processing) ───
+        from .models import DocumentChunk
+        DocumentChunk.objects.filter(document=doc).delete()
+
+        # ── Step 4: Embed and save each chunk ───────────────
+        saved = 0
+        for chunk in processed_chunks:
+            embedding = generate_embedding(chunk.content)
+
+            if embedding is None:
+                print(f"  Skipping chunk {chunk.chunk_index}: embedding failed")
+                continue
+
             DocumentChunk.objects.create(
                 document=doc,
-                content=chunk_content,
+                content=chunk.content,
                 embedding=embedding,
-                metadata={"source": doc.name}
+                metadata={
+                    "source": doc.name,
+                    **(chunk.metadata or {}),
+                },
+                page_number=chunk.page_number,
+                section_title=chunk.section_title,
+                keywords=chunk.keywords,
+                chunk_index=chunk.chunk_index,
+                char_count=len(chunk.content),
             )
-            
+            saved += 1
+
+        doc.total_chunks = saved
+        doc.processing_status = 'completed'
+        doc.save(update_fields=['total_chunks', 'processing_status'])
+
+        print(f"✓ '{doc.name}': {saved} chunks saved "
+              f"(avg {sum(len(c.content) for c in processed_chunks) // max(len(processed_chunks), 1)} chars)")
+
     except Exception as e:
-        print(f"Error processing document {doc.name}: {str(e)}")
+        print(f"✗ Error processing {doc.name}: {str(e)}")
+        doc.processing_status = 'failed'
+        doc.save(update_fields=['processing_status'])
+
 
 @api_view(['GET', 'POST', 'DELETE'])
 @authentication_classes([TokenAuthentication])
 @permission_classes([IsAuthenticated])
+
 def admin_documents(request, doc_id=None):
     if request.user.user_type != 1:
         return Response({'error': 'Unauthorized'}, status=403)
 
     if request.method == 'GET':
         # Only fetch documents that actually have a file attached (excludes chunks if any)
-        docs = Document.objects.filter(file__isnull=False).exclude(file='').order_by('-uploaded_at')
+        docs = Document.objects.filter(file__isnull=False).exclude(file='').order_by('-created_at')
         data = [
             {
                 'id': d.id,
                 'name': d.name,
-                'uploaded_at': d.uploaded_at
+                'uploaded_at': d.created_at
             }
             for d in docs
         ]

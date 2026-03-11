@@ -1,6 +1,10 @@
+# d:\Sumit\Project\P Square\backend\api\rag.py
+
 """
 Solven Analytics Engine v2.0 — Optimized 9-Phase Pipeline
 With real-time phase tracking for frontend sync.
++
+RAG Query System v2.0 — Hybrid Search + Reranking + Source Citations
 """
 
 import json
@@ -10,8 +14,18 @@ import datetime
 import traceback
 import threading
 import re
+import time
+import logging
 from django.db import connection
-from api.ollama_service import generate_response, generate_embedding
+
+from .ollama_service import (
+    generate_response,
+    generate_query_embedding,
+    generate_embedding,
+    score_relevance,
+)
+
+logger = logging.getLogger(__name__)
 
 
 # ═══════════════════════════════════════════════════
@@ -119,7 +133,6 @@ def _llm_call(prompt, max_retries=2):
                 return result
             if attempt < max_retries:
                 print(f"[LLM] Empty on attempt {attempt+1}, retrying...")
-                # Shorten the prompt on retry to avoid token limit
                 prompt = prompt + "\n\nRESPOND WITH ONLY VALID JSON. NO MARKDOWN. NO EXPLANATION."
         except Exception as e:
             print(f"[LLM] Error attempt {attempt+1}: {e}")
@@ -324,34 +337,28 @@ def _safe_value(value):
 
 def _format_kpi_value(value, kpi_name=""):
     """Format numeric value for display. Handles NaN safely."""
-    # ── Handle None, NaN, and invalid values ──
     if value is None:
         return "N/A"
 
     try:
-        # Check for NaN (works for float NaN)
         if isinstance(value, float) and (np.isnan(value) or np.isinf(value)):
             return "N/A"
     except (TypeError, ValueError):
         return "N/A"
 
     try:
-        # Convert to float safely
         value = float(value)
     except (TypeError, ValueError):
         return str(value)
 
-    # ── Check again after conversion ──
     if np.isnan(value) or np.isinf(value):
         return "N/A"
 
     name_lower = kpi_name.lower()
 
-    # Percentage
     if any(w in name_lower for w in ['rate', 'margin', 'percentage', 'ratio', '%', 'share']):
         return f"{value:.2f}%"
 
-    # Currency
     if any(w in name_lower for w in ['revenue', 'profit', 'cost', 'price', 'sales', 'income', 'expense', 'value', 'spend', 'amount']):
         if abs(value) >= 1_000_000_000:
             return f"${value / 1_000_000_000:,.2f}B"
@@ -361,14 +368,12 @@ def _format_kpi_value(value, kpi_name=""):
             return f"${value:,.2f}"
         return f"${value:.2f}"
 
-    # Count
     if any(w in name_lower for w in ['count', 'total', 'number', 'orders', 'customers', 'transactions']):
         try:
             return f"{int(value):,}"
         except (ValueError, OverflowError):
             return f"{value:,.0f}"
 
-    # General number
     if isinstance(value, float):
         try:
             if abs(value) < 1e15 and value == int(value):
@@ -378,6 +383,7 @@ def _format_kpi_value(value, kpi_name=""):
         return f"{value:,.2f}"
 
     return str(value)
+
 
 def _generate_chart_data(df, chart_spec):
     """Execute Pandas aggregation for chart data."""
@@ -393,7 +399,6 @@ def _generate_chart_data(df, chart_spec):
 
         print(f"    x: '{raw_x}' -> '{x_col}' | y: '{raw_y}' -> '{y_col}' | type: {chart_type}")
 
-        # SCATTER
         if chart_type == "scatter":
             if x_col and y_col and x_col in df.columns and y_col in df.columns:
                 scatter = df[[x_col, y_col]].dropna()
@@ -409,7 +414,6 @@ def _generate_chart_data(df, chart_spec):
                 )
             return []
 
-        # HISTOGRAM
         if chart_type == "histogram":
             target = x_col if x_col and x_col in df.columns else y_col
             if target and target in df.columns and pd.api.types.is_numeric_dtype(df[target]):
@@ -421,7 +425,6 @@ def _generate_chart_data(df, chart_spec):
                 return [{"name": f"{edges[i]:.1f}-{edges[i+1]:.1f}", "value": int(counts[i])} for i in range(len(counts))]
             return []
 
-        # STANDARD CHARTS
         grouped = None
 
         if x_col and y_col and x_col in df.columns and y_col in df.columns:
@@ -489,8 +492,6 @@ def _phase_1(df):
     """Phase 1: Schema analysis."""
     profile = _build_profile(df)
 
-    # SHORTER prompt to avoid token limit
-    # Only send first 10 columns if too many
     cols_to_send = profile['columns'][:15]
 
     prompt = f"""Classify these dataset columns. Rows: {profile['total_rows']}, Cols: {profile['total_columns']}
@@ -533,13 +534,11 @@ def _phase_2_3_combined(profile_data, numeric_stats):
     """Phase 2+3: Generate AND select top 5 KPIs with EXACT column names."""
     dp = profile_data.get("dataset_profile", {})
 
-    # Build explicit column list with types
     col_desc = "EXACT COLUMN NAMES IN DATASET:\n"
     for col in dp.get("columns", [])[:20]:
         col_name = col.get('column_name', '?')
         col_class = col.get('classification', '?').upper()
         col_desc += f'  - "{col_name}" [{col_class}]'
-        # Add stats if numeric
         if col_name in numeric_stats:
             s = numeric_stats[col_name]
             col_desc += f' sum={s.get("sum",0)}, mean={s.get("mean",0)}, min={s.get("min",0)}, max={s.get("max",0)}, count={s.get("count",0)}'
@@ -635,19 +634,16 @@ def _phase_5(kpi_specs, df, numeric_stats):
         formula = kpi.get("formula", "").lower()
         columns_used = kpi.get("columns_used", [])
 
-        # Step 1: Resolve actual column names
         resolved_cols = []
         for col_name in columns_used:
             matched = _find_column(col_name, df)
             if matched:
                 resolved_cols.append(matched)
 
-        # Step 2: Try direct formula computation
         if resolved_cols:
             try:
                 first_col = resolved_cols[0]
 
-                # MULTIPLICATION + SUM: SUM(A * B)
                 if len(resolved_cols) >= 2 and any(op in formula for op in ["*", "×", "multiply"]):
                     c1, c2 = resolved_cols[0], resolved_cols[1]
                     if pd.api.types.is_numeric_dtype(df[c1]) and pd.api.types.is_numeric_dtype(df[c2]):
@@ -656,7 +652,6 @@ def _phase_5(kpi_specs, df, numeric_stats):
                         else:
                             value = float((df[c1] * df[c2]).sum())
 
-                # RATIO / DIVISION: A / B
                 elif len(resolved_cols) >= 2 and any(op in formula for op in ["/", "ratio", "margin", "percentage", "%"]):
                     c1, c2 = resolved_cols[0], resolved_cols[1]
                     if pd.api.types.is_numeric_dtype(df[c1]) and pd.api.types.is_numeric_dtype(df[c2]):
@@ -664,53 +659,43 @@ def _phase_5(kpi_specs, df, numeric_stats):
                         if denom != 0:
                             value = round(float(df[c1].sum() / denom * 100), 2)
 
-                # SUBTRACTION: A - B
                 elif len(resolved_cols) >= 2 and "-" in formula and "sub" not in formula:
                     c1, c2 = resolved_cols[0], resolved_cols[1]
                     if pd.api.types.is_numeric_dtype(df[c1]) and pd.api.types.is_numeric_dtype(df[c2]):
                         value = float(df[c1].sum() - df[c2].sum())
 
-                # COUNT DISTINCT
                 elif "distinct" in formula or "unique" in formula:
                     value = int(df[first_col].nunique())
 
-                # COUNT
                 elif "count" in formula and "distinct" not in formula:
                     value = int(df[first_col].count())
 
-                # AVG / MEAN
                 elif any(w in formula for w in ["avg", "average", "mean"]):
                     if pd.api.types.is_numeric_dtype(df[first_col]):
                         value = round(float(df[first_col].mean()), 2)
 
-                # MAX
                 elif any(w in formula for w in ["max", "highest", "maximum"]):
                     if pd.api.types.is_numeric_dtype(df[first_col]):
                         value = float(df[first_col].max())
 
-                # MIN
                 elif any(w in formula for w in ["min", "lowest", "minimum"]):
                     if pd.api.types.is_numeric_dtype(df[first_col]):
                         value = float(df[first_col].min())
 
-                # SUM (default for numeric)
                 elif "sum" in formula or "total" in formula:
                     if pd.api.types.is_numeric_dtype(df[first_col]):
                         value = float(df[first_col].sum())
 
-                # MEDIAN
                 elif "median" in formula:
                     if pd.api.types.is_numeric_dtype(df[first_col]):
                         value = float(df[first_col].median())
 
-                # Fallback: if numeric column, do SUM
                 elif pd.api.types.is_numeric_dtype(df[first_col]):
                     value = float(df[first_col].sum())
 
             except Exception as e:
                 print(f"  [KPI Compute] Error for '{kpi.get('kpi_name', '?')}': {e}")
 
-        # Step 3: Fallback using numeric_stats
         if value is None:
             for col_name in columns_used:
                 for stat_key in numeric_stats:
@@ -733,7 +718,6 @@ def _phase_5(kpi_specs, df, numeric_stats):
                 if value is not None:
                     break
 
-        # Step 4: Last resort using KPI name
         if value is None:
             kpi_name_lower = kpi.get("kpi_name", "").lower()
             if any(w in kpi_name_lower for w in ["count", "number of", "total transactions", "total orders", "total records"]):
@@ -770,6 +754,7 @@ def _phase_5(kpi_specs, df, numeric_stats):
         })
 
     return {"kpis": computed[:5]}
+
 
 # ═══════════════════════════════════════════════════
 # PHASE 6+7 COMBINED
@@ -955,140 +940,14 @@ def _phase_9(profile_data, computed_kpis, charts_with_data, df):
 
 
 # ═══════════════════════════════════════════════════
-# MAIN ENTRY POINT
-# ═══════════════════════════════════════════════════
-
-def run_solven_analytics_pipeline(dataset_path):
-    """Main entry point called by analytics_views.py."""
-    try:
-        _set_phase(0, "Starting", "Loading data...")
-
-        # Load
-        if dataset_path.endswith('.csv'):
-            try:
-                df = pd.read_csv(dataset_path, encoding="utf-8")
-            except UnicodeDecodeError:
-                df = pd.read_csv(dataset_path, encoding="latin1")
-        elif dataset_path.endswith(('.xlsx', '.xls')):
-            df = pd.read_excel(dataset_path)
-        else:
-            _set_error("Unsupported file format")
-            return {"error": "Unsupported file format. Upload CSV or Excel."}
-
-        if df.empty:
-            _set_error("Empty file")
-            return {"error": "The uploaded file contains no data."}
-
-        df.columns = df.columns.str.strip()
-        print(f"[Data] {len(df)} rows x {len(df.columns)} columns")
-
-        numeric_stats = {}
-        for col in df.select_dtypes(include=['number']).columns:
-            try:
-                numeric_stats[col] = {
-                    "sum": float(df[col].sum()) if pd.notnull(df[col].sum()) else 0,
-                    "mean": round(float(df[col].mean()), 2) if pd.notnull(df[col].mean()) else 0,
-                    "min": float(df[col].min()) if pd.notnull(df[col].min()) else 0,
-                    "max": float(df[col].max()) if pd.notnull(df[col].max()) else 0,
-                    "count": int(df[col].count()),
-                }
-            except Exception:
-                pass
-
-        df_columns = list(df.columns)
-
-        # PHASE 1
-        _set_phase(1, "Data Profiling", "LLM Call 1/4")
-        profile_data = _phase_1(df)
-        if not profile_data or "dataset_profile" not in profile_data:
-            print("[Phase 1] Using fallback profile")
-            profile_data = {
-                "dataset_profile": {
-                    "total_rows": len(df), "total_columns": len(df.columns),
-                    "domain": "General", "data_quality_score": "N/A",
-                    "columns": [
-                        {"column_name": c,
-                         "classification": "metric" if pd.api.types.is_numeric_dtype(df[c]) else "dimension",
-                         "null_percentage": round(float(df[c].isnull().sum() / len(df) * 100), 2)}
-                        for c in df.columns
-                    ],
-                    "column_classifications": {
-                        "metrics": list(df.select_dtypes(include=['number']).columns),
-                        "dimensions": list(df.select_dtypes(include=['object', 'category']).columns),
-                        "temporal": [], "identifiers": [],
-                    }
-                },
-                "_numeric_stats": numeric_stats, "_categorical_stats": {},
-                "_all_columns": df_columns, "_temporal_detected": [],
-            }
-        print("[Phase 1] Done")
-
-        # PHASE 2+3
-        _set_phase(2, "KPI Generation", "LLM Call 2/4")
-        selected_kpis = _phase_2_3_combined(profile_data, numeric_stats)
-        if not selected_kpis or not selected_kpis.get("selected_kpis"):
-            _set_error("Could not generate KPIs")
-            return {"error": "Could not generate KPIs from this dataset."}
-        _set_phase(3, "KPI Prioritization", "Selected top 5")
-        print(f"[Phase 2-3] Selected {len(selected_kpis['selected_kpis'])} KPIs")
-
-        # PHASE 4
-        _set_phase(4, "Formula Engineering", "LLM Call 3/4")
-        kpi_formulas = _phase_4(selected_kpis, numeric_stats, df_columns)
-        if not kpi_formulas or not kpi_formulas.get("kpis"):
-            _set_error("Could not engineer formulas")
-            return {"error": "Could not engineer KPI formulas."}
-        print("[Phase 4] Done")
-
-        # PHASE 5
-        _set_phase(5, "KPI Computation", "Computing with Pandas")
-        computed_kpis = _phase_5(kpi_formulas, df, numeric_stats)
-        for kpi in computed_kpis.get("kpis", []):
-            print(f"  -> {kpi['kpi_name']}: {kpi['kpi_value']}")
-        print("[Phase 5] Done")
-
-        # PHASE 6+7
-        _set_phase(6, "Chart Ideation", "LLM Call 4/4")
-        selected_charts = _phase_6_7_combined(profile_data, computed_kpis)
-        if not selected_charts or not selected_charts.get("charts"):
-            _set_error("Could not generate charts")
-            return {"error": "Could not generate charts."}
-        _set_phase(7, "Chart Selection", "Selected top 6")
-        print(f"[Phase 6-7] Selected {len(selected_charts['charts'])} charts")
-
-        # PHASE 8
-        _set_phase(8, "Chart Data Generation", "Aggregating with Pandas")
-        charts_with_data = _phase_8(df, selected_charts)
-        for chart in charts_with_data.get("charts", []):
-            print(f"  -> {chart.get('title', '?')}: {len(chart.get('data', []))} points")
-        print("[Phase 8] Done")
-
-        # PHASE 9
-        _set_phase(9, "Final Consolidation", "Assembling output")
-        final = _phase_9(profile_data, computed_kpis, charts_with_data, df)
-        _set_complete()
-
-        print("\n[Solven Analytics v2.0] Pipeline Complete!")
-        return final
-
-    except Exception as e:
-        print(f"\n[ERROR] {e}")
-        traceback.print_exc()
-        _set_error(str(e))
-        return {"error": f"Pipeline failed: {str(e)}"}
-
-
-
-# ===================================================================
 # ANALYTICS MAIN ENTRY POINT
-# ===================================================================
+# ═══════════════════════════════════════════════════
 
 def run_solven_analytics_pipeline(dataset_path):
     """Main entry point for analytics pipeline. Called by analytics_views.py."""
     try:
         _set_phase(0, "Starting", "Loading data...")
 
-        # Load file
         if dataset_path.endswith('.csv'):
             try:
                 df = pd.read_csv(dataset_path, encoding="utf-8")
@@ -1217,75 +1076,462 @@ def run_solven_analytics_pipeline(dataset_path):
         return {"error": f"Pipeline failed: {str(e)}"}
 
 
-# ===================================================================
-# ===================================================================
+# ═══════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════
 #
-#   RAG QUERY SYSTEM — Hybrid Search + SQL + Knowledge Retrieval
+#   RAG QUERY SYSTEM v2.0
+#   Hybrid Search + Query Expansion + Reranking + Source Citations
 #
-# ===================================================================
-# ===================================================================
+# ═══════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════
 
+
+# ─── RAG Configuration ────────────────────────────────────────
+RAG_RETRIEVAL_TOP_K = 15        # chunks to retrieve initially
+RAG_RERANK_TOP_K = 5            # chunks to keep after reranking
+RAG_VECTOR_WEIGHT = 0.65        # weight for vector similarity
+RAG_KEYWORD_WEIGHT = 0.35       # weight for keyword match
+RAG_MIN_SIMILARITY = 0.20       # discard chunks below this
+RAG_MAX_CONTEXT_CHARS = 3000    # max context sent to LLM
+RAG_ENABLE_QUERY_EXPANSION = True
+RAG_ENABLE_RERANKING = True
+RAG_ENABLE_SOURCE_CITATION = True
+
+
+# ═══════════════════════════════════════════════════
+# RAG HELPER: Query Expansion
+# ═══════════════════════════════════════════════════
+
+def _rag_expand_query(question):
+    """
+    Generate alternative phrasings of the user question to improve recall.
+
+    Example:
+        Input:  "leave policy"
+        Output: ["leave policy", "vacation rules", "paid time off",
+                 "employee leave entitlement"]
+
+    WHY: User might say "leave policy" but the document says "vacation".
+         By searching with multiple phrasings, we catch more relevant chunks.
+    """
+    if not RAG_ENABLE_QUERY_EXPANSION:
+        return [question]
+
+    prompt = f"""Generate 3 alternative search queries for this question.
+Include synonyms and related terms. One per line.
+Do NOT include numbering or the original question.
+
+Question: {question}
+
+Alternatives:"""
+
+    try:
+        response = generate_response(prompt, temperature=0.4, max_tokens=150)
+        alternatives = [
+            line.strip().lstrip("0123456789.-) ")
+            for line in response.strip().split("\n")
+            if line.strip() and len(line.strip()) > 3
+        ]
+        result = [question] + alternatives[:3]
+        print(f"[RAG] Query expanded: {result}")
+        return result
+    except Exception as e:
+        print(f"[RAG] Query expansion failed: {e}")
+        return [question]
+
+
+# ═══════════════════════════════════════════════════
+# RAG HELPER: Hybrid Search (Vector + Keyword)
+# ═══════════════════════════════════════════════════
+
+def _rag_hybrid_search(query, top_k=None):
+    """
+    Two-pronged search combining semantic understanding with exact matching.
+
+    VECTOR SEARCH:
+        Converts query to embedding, finds chunks with similar meaning.
+        "time off" matches "leave policy" (different words, same meaning)
+
+    KEYWORD SEARCH:
+        PostgreSQL full-text search for exact term matching.
+        Catches specific names, policy numbers, exact phrases.
+
+    Results are combined with configurable weights (65% vector, 35% keyword).
+    """
+    top_k = top_k or RAG_RETRIEVAL_TOP_K
+
+    # Use query-specific embedding (with "search_query:" prefix)
+    query_embedding = generate_query_embedding(query)
+    if not query_embedding:
+        query_embedding = generate_embedding(query)
+    if not query_embedding:
+        print("[RAG] Could not generate query embedding")
+        return []
+
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute("""
+                WITH vector_results AS (
+                    SELECT
+                        dc.id,
+                        dc.content,
+                        dc.metadata,
+                        dc.page_number,
+                        dc.section_title,
+                        dc.keywords,
+                        1 - (dc.embedding <=> %s::vector) AS vector_sim
+                    FROM document_chunks dc
+                    ORDER BY dc.embedding <=> %s::vector
+                    LIMIT %s
+                ),
+                keyword_results AS (
+                    SELECT
+                        dc.id,
+                        ts_rank_cd(
+                            to_tsvector('english', dc.content),
+                            plainto_tsquery('english', %s)
+                        ) AS kw_rank
+                    FROM document_chunks dc
+                    WHERE to_tsvector('english', dc.content)
+                          @@ plainto_tsquery('english', %s)
+                    LIMIT %s
+                )
+                SELECT
+                    v.id,
+                    v.content,
+                    v.metadata,
+                    v.page_number,
+                    v.section_title,
+                    v.keywords,
+                    v.vector_sim,
+                    COALESCE(k.kw_rank, 0) AS kw_rank
+                FROM vector_results v
+                LEFT JOIN keyword_results k ON v.id = k.id
+                ORDER BY (
+                    %s * v.vector_sim +
+                    %s * COALESCE(k.kw_rank, 0)
+                ) DESC
+                LIMIT %s
+            """, [
+                query_embedding,        # vector CTE: embedding param
+                query_embedding,        # vector CTE: ORDER BY param
+                top_k * 2,             # vector CTE: LIMIT
+                query,                 # keyword CTE: ts_rank param
+                query,                 # keyword CTE: WHERE param
+                top_k * 2,            # keyword CTE: LIMIT
+                RAG_VECTOR_WEIGHT,     # final ORDER BY: vector weight
+                RAG_KEYWORD_WEIGHT,    # final ORDER BY: keyword weight
+                top_k,                # final LIMIT
+            ])
+
+            rows = cursor.fetchall()
+
+        results = []
+        for row in rows:
+            vector_sim = float(row[6]) if row[6] else 0
+            kw_rank = float(row[7]) if row[7] else 0
+
+            if vector_sim < RAG_MIN_SIMILARITY:
+                continue
+
+            combined_score = RAG_VECTOR_WEIGHT * vector_sim + RAG_KEYWORD_WEIGHT * kw_rank
+
+            results.append({
+                "id": row[0],
+                "content": row[1],
+                "metadata": row[2] or {},
+                "page_number": row[3],
+                "section_title": row[4] or "",
+                "keywords": row[5] or [],
+                "vector_score": round(vector_sim, 4),
+                "keyword_score": round(kw_rank, 4),
+                "score": round(combined_score, 4),
+            })
+
+        print(f"[RAG] Hybrid search: {len(results)} results for '{query[:50]}'")
+        return results
+
+    except Exception as e:
+        print(f"[RAG] Hybrid search failed ({e}), falling back to simple vector search")
+        return _rag_simple_vector_search(query_embedding, top_k)
+
+
+def _rag_simple_vector_search(query_embedding, top_k):
+    """Fallback: plain vector-only search if hybrid query fails."""
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute("""
+                SELECT
+                    id, content, metadata, page_number,
+                    section_title, keywords,
+                    1 - (embedding <=> %s::vector) AS similarity
+                FROM document_chunks
+                ORDER BY embedding <=> %s::vector
+                LIMIT %s
+            """, [query_embedding, query_embedding, top_k])
+
+            return [{
+                "id": r[0],
+                "content": r[1],
+                "metadata": r[2] or {},
+                "page_number": r[3],
+                "section_title": r[4] or "",
+                "keywords": r[5] or [],
+                "vector_score": float(r[6]) if r[6] else 0,
+                "keyword_score": 0,
+                "score": float(r[6]) if r[6] else 0,
+            } for r in cursor.fetchall()]
+    except Exception as e:
+        print(f"[RAG] Simple vector search also failed: {e}")
+        return []
+
+
+# ═══════════════════════════════════════════════════
+# RAG HELPER: Multi-Query Search
+# ═══════════════════════════════════════════════════
+
+def _rag_multi_query_search(queries):
+    """
+    Search with each expanded query variant, merge results.
+    Deduplicates by chunk ID, keeps highest score.
+    """
+    all_results = {}
+
+    for q in queries:
+        results = _rag_hybrid_search(q)
+        for r in results:
+            cid = r["id"]
+            if cid not in all_results or r["score"] > all_results[cid]["score"]:
+                all_results[cid] = r
+
+    merged = sorted(all_results.values(), key=lambda x: x["score"], reverse=True)
+    return merged[:RAG_RETRIEVAL_TOP_K]
+
+
+# ═══════════════════════════════════════════════════
+# RAG HELPER: Reranking
+# ═══════════════════════════════════════════════════
+
+def _rag_rerank(query, chunks):
+    """
+    Reorder retrieved chunks by true relevance to the query.
+
+    WHY RERANKING?
+    Vector search finds chunks that are "roughly similar".
+    Reranking uses more careful analysis to find the TRULY relevant ones.
+
+    Example: query = "how many leave days"
+      Chunk A: "The leave policy was updated in 2023." (similar words, wrong answer)
+      Chunk B: "Employees receive 12 days of paid leave." (actually answers!)
+    Reranking pushes Chunk B to the top.
+    """
+    if not RAG_ENABLE_RERANKING or len(chunks) <= RAG_RERANK_TOP_K:
+        return chunks[:RAG_RERANK_TOP_K]
+
+    query_terms = set(query.lower().split())
+
+    for chunk in chunks:
+        content_lower = chunk["content"].lower()
+        content_terms = set(content_lower.split())
+
+        # Score 1: How many query words appear in the chunk?
+        word_overlap = len(query_terms & content_terms) / max(len(query_terms), 1)
+
+        # Score 2: Does the exact query phrase appear?
+        phrase_bonus = 0.2 if query.lower() in content_lower else 0.0
+
+        # Score 3: Do chunk keywords match query terms?
+        kw_matches = sum(
+            1 for kw in chunk.get("keywords", [])
+            if any(qt in str(kw).lower() for qt in query_terms)
+        )
+        keyword_bonus = min(kw_matches * 0.1, 0.3)
+
+        # Score 4: Does section title match?
+        section = (chunk.get("section_title") or "").lower()
+        section_bonus = 0.15 if any(qt in section for qt in query_terms) else 0.0
+
+        # Combined rerank score
+        rerank_score = word_overlap + phrase_bonus + keyword_bonus + section_bonus
+
+        # Final score = blend of retrieval score and rerank score
+        chunk["rerank_score"] = round(rerank_score, 4)
+        chunk["final_score"] = round(
+            0.5 * chunk["score"] + 0.5 * rerank_score, 4
+        )
+
+    chunks.sort(key=lambda x: x.get("final_score", 0), reverse=True)
+
+    if chunks:
+        print(
+            f"[RAG] Reranked: top score {chunks[0]['final_score']:.3f} "
+            f"(was {chunks[0]['score']:.3f})"
+        )
+
+    return chunks[:RAG_RERANK_TOP_K]
+
+
+# ═══════════════════════════════════════════════════
+# RAG HELPER: Context Building with Source Citations
+# ═══════════════════════════════════════════════════
+
+def _rag_build_context(chunks):
+    """
+    Build the context string sent to the LLM.
+    Includes source markers so the LLM can cite where info came from.
+    Deduplicates overlapping content.
+
+    Output format:
+        [Source: company_policy.pdf | Page 3 | Section: Leave Policy]
+        Employees are entitled to 12 days of paid leave per year...
+        ---
+        [Source: company_policy.pdf | Page 5 | Section: Working Hours]
+        Standard working hours are 9:00 AM to 6:00 PM...
+    """
+    seen = set()
+    context_parts = []
+
+    for chunk in chunks:
+        # Dedup by first 80 chars
+        fingerprint = chunk["content"][:80].strip().lower()
+        if fingerprint in seen:
+            continue
+        seen.add(fingerprint)
+
+         # ── FIX: Handle metadata as string OR dict ──
+        metadata = chunk.get("metadata", {})
+        if isinstance(metadata, str):
+            try:
+                metadata = json.loads(metadata)
+            except Exception:
+                metadata = {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+
+        source = metadata.get("source", "Document")
+        page = chunk.get("page_number")
+        section = chunk.get("section_title")
+
+        header = f"[Source: {source}"
+        if page:
+            header += f" | Page {page}"
+        if section:
+            header += f" | Section: {section}"
+        header += "]"
+
+        context_parts.append(f"{header}\n{chunk['content']}")
+
+    context = "\n\n---\n\n".join(context_parts)
+
+    if len(context) > RAG_MAX_CONTEXT_CHARS:
+        context = context[:RAG_MAX_CONTEXT_CHARS] + "\n\n[... truncated for length]"
+
+    return context
+
+
+def _rag_build_source_list(chunks):
+    """Build a clean source citation string for the answer."""
+    sources = []
+    seen = set()
+
+    for chunk in chunks:
+        # ── FIX: Handle metadata as string OR dict ──
+        metadata = chunk.get("metadata", {})
+        if isinstance(metadata, str):
+            try:
+                metadata = json.loads(metadata)
+            except Exception:
+                metadata = {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+
+        source = metadata.get("source", "")
+        page = chunk.get("page_number")
+        section = chunk.get("section_title", "")
+
+        key = (source, page, section)
+        if key in seen:
+            continue
+        seen.add(key)
+
+        entry = source
+        if page:
+            entry += f", Page {page}"
+        if section:
+            entry += f", Section: {section}"
+        sources.append(entry)
+
+    return sources
+
+# ═══════════════════════════════════════════════════
+# BACKWARD COMPATIBLE: similarity_search
+# ═══════════════════════════════════════════════════
 
 def similarity_search(query, top_k=3):
     """
-    Hybrid Search: Combines Vector Search (Semantic) + Keyword Search (Exact Match).
-    Requires pgvector extension and document_chunks table.
+    BACKWARD COMPATIBLE wrapper.
+    Now internally uses hybrid search + query expansion + reranking.
+
+    Returns same format as before:
+        [{"content": str, "metadata": dict, "distance": float}, ...]
+
+    Any code that calls similarity_search() keeps working.
     """
-    query_embedding = generate_embedding(query)
+    # Expand query for better recall
+    expanded = _rag_expand_query(query)
 
-    # 1. Vector Search (Semantic)
-    with connection.cursor() as cursor:
-        cursor.execute("""
-            SELECT content, metadata, (embedding <=> %s::vector) as distance
-            FROM document_chunks
-            ORDER BY distance
-            LIMIT %s
-        """, [query_embedding, top_k])
-        vector_results = cursor.fetchall()
+    # Multi-query hybrid search
+    chunks = _rag_multi_query_search(expanded)
 
-    # 2. Keyword Search (Full-Text Search)
-    with connection.cursor() as cursor:
-        cursor.execute("""
-            SELECT content, metadata, 0.0 as distance
-            FROM document_chunks
-            WHERE to_tsvector('english', content) @@ plainto_tsquery('english', %s)
-            LIMIT %s
-        """, [query, top_k])
-        keyword_results = cursor.fetchall()
+    # Rerank for precision
+    reranked = _rag_rerank(query, chunks)
 
-    # 3. Combine & Deduplicate
-    combined_results = {}
+    # Convert to old format for backward compatibility
+    results = []
+    for chunk in reranked[:top_k]:
+        results.append({
+            "content": chunk["content"],
+            "metadata": chunk.get("metadata", {}),
+            "distance": 1.0 - chunk.get("score", 0),
+            # New fields (available but won't break old code)
+            "page_number": chunk.get("page_number"),
+            "section_title": chunk.get("section_title"),
+            "keywords": chunk.get("keywords", []),
+            "score": chunk.get("score", 0),
+        })
 
-    for row in vector_results:
-        combined_results[row[0]] = {
-            "content": row[0],
-            "metadata": row[1],
-            "distance": row[2],
-        }
+    return results
 
-    for row in keyword_results:
-        if row[0] not in combined_results:
-            combined_results[row[0]] = {
-                "content": row[0],
-                "metadata": row[1],
-                "distance": 0.0,
-            }
 
-    final_results = list(combined_results.values())
-    final_results.sort(key=lambda x: x['distance'])
-
-    return final_results[:top_k]
-
+# ═══════════════════════════════════════════════════
+# MAIN RAG QUERY FUNCTION
+# ═══════════════════════════════════════════════════
 
 def rag_query(question, chat_history=None):
     """
     Main RAG query handler.
     Routes to: Database (SQL) | Knowledge (RAG) | Conversational | Irrelevant.
-    """
 
-    # -------------------------
-    # 0. Contextualize Question (Memory)
-    # -------------------------
+    SAME INPUT:  question (str), chat_history (list)
+    SAME OUTPUT: answer string
+
+    WHAT CHANGED INTERNALLY (knowledge path only):
+        OLD:  similarity_search → simple vector distance → send to LLM
+        NEW:  query expansion → hybrid search (vector + keyword) →
+              reranking → context with source markers → better LLM prompt
+
+    WHAT IS IDENTICAL:
+        - Chat history contextualization
+        - Question classification
+        - Database SQL generation
+        - Conversational handler
+        - Irrelevant handler
+    """
+    total_start = time.time()
+
+    # ─────────────────────────────────────────────────
+    # 0. Contextualize Question (Memory) — UNCHANGED
+    # ─────────────────────────────────────────────────
     search_query = question
 
     if chat_history and len(chat_history) > 0:
@@ -1312,9 +1558,9 @@ Standalone Question:
         print(f"DEBUG: Original: '{question}' -> Rewritten: '{rewritten}'")
         search_query = rewritten
 
-    # -------------------------
-    # 1. Classify question
-    # -------------------------
+    # ─────────────────────────────────────────────────
+    # 1. Classify question — UNCHANGED
+    # ─────────────────────────────────────────────────
     classification_prompt = f"""
 Classify the user's question into ONE of the following categories:
 
@@ -1331,9 +1577,9 @@ Question:
     question_type = generate_response(classification_prompt).strip().lower()
     print(f"DEBUG: Question '{search_query}' classified as: {question_type}")
 
-    # -------------------------
-    # 2. Database -> Generate SQL
-    # -------------------------
+    # ─────────────────────────────────────────────────
+    # 2. Database -> Generate SQL — UNCHANGED
+    # ─────────────────────────────────────────────────
     if "database" in question_type:
 
         sql_prompt = f"""
@@ -1386,7 +1632,6 @@ SQL Query:
 
         sql_query = generate_response(sql_prompt).strip()
 
-        # Remove markdown formatting if LLM adds it
         match = re.search(
             r"```(?:sql)?\s*(.*?)```", sql_query, re.DOTALL | re.IGNORECASE
         )
@@ -1395,7 +1640,6 @@ SQL Query:
         else:
             sql_query = sql_query.replace("```sql", "").replace("```", "").strip()
 
-        # Safety check
         forbidden_keywords = ["drop", "delete", "update", "insert", "alter", "truncate"]
         if any(keyword in sql_query.lower() for keyword in forbidden_keywords):
             return "Unsafe query detected."
@@ -1416,21 +1660,53 @@ SQL Query:
         except Exception as e:
             return f"Error executing generated SQL: {str(e)}"
 
-    # -------------------------
-    # 3. Knowledge -> Use RAG
-    # -------------------------
+    # ─────────────────────────────────────────────────
+    # 3. Knowledge -> UPGRADED RAG PIPELINE
+    # ─────────────────────────────────────────────────
     if "knowledge" in question_type:
+        print(f"[RAG] Starting knowledge pipeline for: '{search_query[:60]}'")
 
-        docs = similarity_search(search_query, top_k=5)
+        # ── Step 3a: Query Expansion ───────────────────
+        #    "leave policy" → ["leave policy", "vacation rules", "paid time off"]
+        expanded_queries = _rag_expand_query(search_query)
 
-        if not docs:
-            return "No relevant information found."
+        # ── Step 3b: Hybrid Search with all query variants ─
+        retrieval_start = time.time()
+        retrieved_chunks = _rag_multi_query_search(expanded_queries)
+        retrieval_ms = (time.time() - retrieval_start) * 1000
 
-        context = "\n\n".join([doc["content"] for doc in docs])
+        if not retrieved_chunks:
+            return "No relevant information found in the uploaded documents."
+
+        print(f"[RAG] Retrieved {len(retrieved_chunks)} chunks in {retrieval_ms:.0f}ms")
+
+        # ── Step 3c: Reranking ─────────────────────────
+        #    15 chunks → top 5 most relevant
+        rerank_start = time.time()
+        reranked_chunks = _rag_rerank(search_query, retrieved_chunks)
+        rerank_ms = (time.time() - rerank_start) * 1000
+
+        print(f"[RAG] Reranked to {len(reranked_chunks)} chunks in {rerank_ms:.0f}ms")
+
+        # ── Step 3d: Build context with source markers ─
+        context = _rag_build_context(reranked_chunks)
+
+        # ── Step 3e: Build source citation list ────────
+        sources = _rag_build_source_list(reranked_chunks)
+
+        # ── Step 3f: Generate answer with better prompt ─
+        source_instruction = ""
+        if RAG_ENABLE_SOURCE_CITATION and sources:
+            source_instruction = """
+After your answer, cite your sources in this format:
+
+Sources:
+- [Document name, Page X, Section: Y]"""
 
         prompt = f"""You are a helpful assistant. Your task is to answer the user's question based *only* on the provided context.
-Do not mention the context in your answer. Just provide the answer directly.
+Do not mention "the context" or "the document" in your answer. Just provide the answer directly.
 If the information is not in the context, state that the answer is not available in the provided data.
+{source_instruction}
 
 Context:
 {context}
@@ -1441,20 +1717,1536 @@ User's Question:
 Answer:
 """
 
-        return generate_response(prompt)
+        answer = generate_response(prompt)
 
-    # -------------------------
-    # 3b. Conversational
-    # -------------------------
+        total_ms = (time.time() - total_start) * 1000
+        print(
+            f"[RAG] Complete: {len(retrieved_chunks)} retrieved → "
+            f"{len(reranked_chunks)} reranked → answer in {total_ms:.0f}ms"
+        )
+
+        return answer
+
+    # ─────────────────────────────────────────────────
+    # 3b. Conversational — UNCHANGED
+    # ─────────────────────────────────────────────────
     if "conversational" in question_type:
         return generate_response(
             f"Respond politely to this conversational input: {search_query}"
         )
 
-    # -------------------------
-    # 4. Irrelevant
-    # -------------------------
+    # ─────────────────────────────────────────────────
+    # 4. Irrelevant — UNCHANGED
+    # ─────────────────────────────────────────────────
     return "Please ask a question related to the dataset."
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# """
+# Solven Analytics Engine v2.0 — Optimized 9-Phase Pipeline
+# With real-time phase tracking for frontend sync.
+# """
+
+# import json
+# import pandas as pd
+# import numpy as np
+# import datetime
+# import traceback
+# import threading
+# import re
+# import time
+# import logging
+# from django.db import connection
+# from api.ollama_service import generate_response, generate_embedding
+
+# from .ollama_service import (
+#     generate_response,
+#     generate_query_embedding,
+#     generate_embedding,
+#     score_relevance,
+# )
+
+# logger = logging.getLogger(__name__)
+
+# # ═══════════════════════════════════════════════════
+# # PHASE TRACKER — Frontend polls this via API
+# # ═══════════════════════════════════════════════════
+
+# _phase_lock = threading.Lock()
+# _current_phase = {
+#     "phase": 0,
+#     "phase_name": "Waiting",
+#     "status": "idle",
+#     "detail": "",
+# }
+
+
+# def get_current_phase():
+#     """Called by analytics_views.py to return current phase to frontend."""
+#     with _phase_lock:
+#         return dict(_current_phase)
+
+
+# def _set_phase(phase_num, phase_name, detail=""):
+#     """Update the current phase (called internally during pipeline)."""
+#     with _phase_lock:
+#         _current_phase["phase"] = phase_num
+#         _current_phase["phase_name"] = phase_name
+#         _current_phase["status"] = "running"
+#         _current_phase["detail"] = detail
+#     print(f"[Phase {phase_num}/9] {phase_name}... {detail}")
+
+
+# def _set_complete():
+#     """Mark pipeline as complete."""
+#     with _phase_lock:
+#         _current_phase["phase"] = 9
+#         _current_phase["phase_name"] = "Complete"
+#         _current_phase["status"] = "complete"
+#         _current_phase["detail"] = ""
+
+
+# def _set_error(msg):
+#     """Mark pipeline as errored."""
+#     with _phase_lock:
+#         _current_phase["status"] = "error"
+#         _current_phase["detail"] = msg
+
+
+# # ═══════════════════════════════════════════════════
+# # UTILITY HELPERS
+# # ═══════════════════════════════════════════════════
+
+# def _safe_json_loads(json_str):
+#     """Parse JSON from LLM response."""
+#     if not json_str or not isinstance(json_str, str):
+#         return {}
+#     try:
+#         cleaned = json_str.strip()
+#         if "```json" in cleaned:
+#             cleaned = cleaned.split("```json", 1)[1].split("```", 1)[0]
+#         elif "```" in cleaned:
+#             parts = cleaned.split("```")
+#             if len(parts) >= 3:
+#                 cleaned = parts[1]
+#                 first_nl = cleaned.find('\n')
+#                 if first_nl != -1 and first_nl < 20:
+#                     maybe_lang = cleaned[:first_nl].strip()
+#                     if maybe_lang.isalpha():
+#                         cleaned = cleaned[first_nl:]
+#         cleaned = cleaned.strip()
+#         return json.loads(cleaned)
+#     except json.JSONDecodeError:
+#         try:
+#             start_obj = cleaned.find('{')
+#             start_arr = cleaned.find('[')
+#             if start_obj == -1 and start_arr == -1:
+#                 return {}
+#             if start_arr != -1 and (start_obj == -1 or start_arr < start_obj):
+#                 start, open_c, close_c = start_arr, '[', ']'
+#             else:
+#                 start, open_c, close_c = start_obj, '{', '}'
+#             depth = 0
+#             for i in range(start, len(cleaned)):
+#                 if cleaned[i] == open_c:
+#                     depth += 1
+#                 elif cleaned[i] == close_c:
+#                     depth -= 1
+#                 if depth == 0:
+#                     return json.loads(cleaned[start:i + 1])
+#         except Exception:
+#             pass
+#         print(f"[JSON Parser] Failed. Preview: {json_str[:300]}")
+#         return {}
+#     except Exception as e:
+#         print(f"[JSON Parser] Error: {e}")
+#         return {}
+
+
+# def _llm_call(prompt, max_retries=2):
+#     """Call LLM with retry on failure."""
+#     for attempt in range(max_retries + 1):
+#         try:
+#             raw = generate_response(prompt)
+#             result = _safe_json_loads(raw)
+#             if result:
+#                 return result
+#             if attempt < max_retries:
+#                 print(f"[LLM] Empty on attempt {attempt+1}, retrying...")
+#                 # Shorten the prompt on retry to avoid token limit
+#                 prompt = prompt + "\n\nRESPOND WITH ONLY VALID JSON. NO MARKDOWN. NO EXPLANATION."
+#         except Exception as e:
+#             print(f"[LLM] Error attempt {attempt+1}: {e}")
+#     return {}
+
+
+# def _to_serializable(obj):
+#     """Convert numpy/pandas types to Python types."""
+#     if isinstance(obj, dict):
+#         return {k: _to_serializable(v) for k, v in obj.items()}
+#     elif isinstance(obj, list):
+#         return [_to_serializable(v) for v in obj]
+#     elif isinstance(obj, (np.int64, np.int32, np.int16, np.int8)):
+#         return int(obj)
+#     elif isinstance(obj, (np.float64, np.float32, np.float16)):
+#         return float(obj) if not np.isnan(obj) else 0
+#     elif isinstance(obj, np.bool_):
+#         return bool(obj)
+#     elif isinstance(obj, (pd.Timestamp, datetime.datetime)):
+#         return obj.isoformat()
+#     elif isinstance(obj, pd.Series):
+#         return obj.tolist()
+#     elif pd.api.types.is_scalar(obj) and pd.isna(obj):
+#         return None
+#     return obj
+
+
+# # ═══════════════════════════════════════════════════
+# # DATA HELPERS
+# # ═══════════════════════════════════════════════════
+
+# def _build_profile(df):
+#     """Build statistical profile of DataFrame."""
+#     profile = {
+#         "total_rows": len(df),
+#         "total_columns": len(df.columns),
+#         "columns": [],
+#         "numeric_stats": {},
+#         "categorical_stats": {},
+#         "temporal_detected": [],
+#         "sample_data": _to_serializable(
+#             df.head(3).fillna("NULL").to_dict(orient='records')
+#         ),
+#     }
+
+#     for col in df.columns:
+#         info = {
+#             "column_name": col,
+#             "pandas_dtype": str(df[col].dtype),
+#             "null_percentage": round(float(df[col].isnull().sum() / max(len(df), 1) * 100), 2),
+#             "unique_values": int(df[col].nunique()),
+#         }
+
+#         non_null = df[col].dropna()
+#         info["sample_values"] = [str(v) for v in non_null.head(3).tolist()] if len(non_null) > 0 else []
+
+#         if pd.api.types.is_numeric_dtype(df[col]):
+#             try:
+#                 stats = {
+#                     "sum": float(df[col].sum()) if pd.notnull(df[col].sum()) else 0,
+#                     "mean": round(float(df[col].mean()), 2) if pd.notnull(df[col].mean()) else 0,
+#                     "min": float(df[col].min()) if pd.notnull(df[col].min()) else 0,
+#                     "max": float(df[col].max()) if pd.notnull(df[col].max()) else 0,
+#                     "count": int(df[col].count()),
+#                 }
+#                 info["is_numeric"] = True
+#                 profile["numeric_stats"][col] = stats
+#             except Exception:
+#                 info["is_numeric"] = False
+#         else:
+#             info["is_numeric"] = False
+
+#         if df[col].dtype == 'object' or df[col].dtype.name == 'category':
+#             try:
+#                 vc = df[col].value_counts().head(8)
+#                 info["top_values"] = {str(k): int(v) for k, v in vc.items()}
+#                 info["is_categorical"] = True
+#                 profile["categorical_stats"][col] = info["top_values"]
+#             except Exception:
+#                 info["is_categorical"] = False
+#         else:
+#             info["is_categorical"] = False
+
+#         info["is_temporal"] = False
+#         if pd.api.types.is_datetime64_any_dtype(df[col]):
+#             info["is_temporal"] = True
+#             profile["temporal_detected"].append(col)
+#         elif df[col].dtype == 'object':
+#             try:
+#                 sample = df[col].dropna().head(20)
+#                 parsed = pd.to_datetime(sample, infer_datetime_format=True, errors='coerce')
+#                 if parsed.notna().sum() >= len(sample) * 0.7:
+#                     info["is_temporal"] = True
+#                     profile["temporal_detected"].append(col)
+#             except Exception:
+#                 pass
+
+#         profile["columns"].append(info)
+
+#     return _to_serializable(profile)
+
+
+# def _find_column(name, df):
+#     """Find the best matching column in DataFrame."""
+#     if not name:
+#         return None
+#     if name in df.columns:
+#         return name
+#     for col in df.columns:
+#         if col.lower() == name.lower():
+#             return col
+#     for col in df.columns:
+#         if name.lower() in col.lower() or col.lower() in name.lower():
+#             return col
+#     clean_name = name.lower().replace(" ", "").replace("_", "").replace("-", "")
+#     for col in df.columns:
+#         clean_col = col.lower().replace(" ", "").replace("_", "").replace("-", "")
+#         if clean_name == clean_col:
+#             return col
+#     return None
+
+
+# def _compute_kpi_value(df, kpi_spec):
+#     """Compute KPI value using Pandas with fuzzy column matching."""
+#     try:
+#         formula = kpi_spec.get("formula", "").lower()
+#         columns_used = kpi_spec.get("columns_used", [])
+
+#         valid_cols = []
+#         for col_name in columns_used:
+#             matched = _find_column(col_name, df)
+#             if matched:
+#                 valid_cols.append(matched)
+
+#         if not valid_cols:
+#             for real_col in df.columns:
+#                 if pd.api.types.is_numeric_dtype(df[real_col]):
+#                     if real_col.lower() in formula:
+#                         valid_cols.append(real_col)
+
+#         if not valid_cols:
+#             return None
+
+#         if ("*" in formula or "x" in formula) and "sum" in formula:
+#             if len(valid_cols) >= 2:
+#                 c1, c2 = valid_cols[0], valid_cols[1]
+#                 if pd.api.types.is_numeric_dtype(df[c1]) and pd.api.types.is_numeric_dtype(df[c2]):
+#                     return float((df[c1] * df[c2]).sum())
+
+#         if any(w in formula for w in ["ratio", "%", "margin", "percentage", "/"]):
+#             if len(valid_cols) >= 2:
+#                 if pd.api.types.is_numeric_dtype(df[valid_cols[0]]) and pd.api.types.is_numeric_dtype(df[valid_cols[1]]):
+#                     denom = df[valid_cols[1]].sum()
+#                     if denom and denom != 0:
+#                         return round(float(df[valid_cols[0]].sum() / denom * 100), 2)
+
+#         if "sum" in formula and pd.api.types.is_numeric_dtype(df[valid_cols[0]]):
+#             return float(df[valid_cols[0]].sum())
+
+#         if any(w in formula for w in ["avg", "average", "mean"]):
+#             if pd.api.types.is_numeric_dtype(df[valid_cols[0]]):
+#                 return round(float(df[valid_cols[0]].mean()), 2)
+
+#         if "distinct" in formula or "unique" in formula:
+#             return int(df[valid_cols[0]].nunique())
+
+#         if "count" in formula:
+#             return int(df[valid_cols[0]].count())
+
+#         if "max" in formula or "highest" in formula:
+#             if pd.api.types.is_numeric_dtype(df[valid_cols[0]]):
+#                 return float(df[valid_cols[0]].max())
+
+#         if "min" in formula or "lowest" in formula:
+#             if pd.api.types.is_numeric_dtype(df[valid_cols[0]]):
+#                 return float(df[valid_cols[0]].min())
+
+#         if "-" in formula and len(valid_cols) >= 2:
+#             if pd.api.types.is_numeric_dtype(df[valid_cols[0]]) and pd.api.types.is_numeric_dtype(df[valid_cols[1]]):
+#                 return float(df[valid_cols[0]].sum() - df[valid_cols[1]].sum())
+
+#         if pd.api.types.is_numeric_dtype(df[valid_cols[0]]):
+#             return float(df[valid_cols[0]].sum())
+
+#         return None
+#     except Exception as e:
+#         print(f"[KPI Compute] Error: {e}")
+#         return None
+
+
+# def _safe_value(value):
+#     """Ensure value is not NaN/Inf before using it."""
+#     if value is None:
+#         return None
+#     try:
+#         if isinstance(value, float) and (np.isnan(value) or np.isinf(value)):
+#             return None
+#     except (TypeError, ValueError):
+#         return None
+#     return value
+
+
+# def _format_kpi_value(value, kpi_name=""):
+#     """Format numeric value for display. Handles NaN safely."""
+#     # ── Handle None, NaN, and invalid values ──
+#     if value is None:
+#         return "N/A"
+
+#     try:
+#         # Check for NaN (works for float NaN)
+#         if isinstance(value, float) and (np.isnan(value) or np.isinf(value)):
+#             return "N/A"
+#     except (TypeError, ValueError):
+#         return "N/A"
+
+#     try:
+#         # Convert to float safely
+#         value = float(value)
+#     except (TypeError, ValueError):
+#         return str(value)
+
+#     # ── Check again after conversion ──
+#     if np.isnan(value) or np.isinf(value):
+#         return "N/A"
+
+#     name_lower = kpi_name.lower()
+
+#     # Percentage
+#     if any(w in name_lower for w in ['rate', 'margin', 'percentage', 'ratio', '%', 'share']):
+#         return f"{value:.2f}%"
+
+#     # Currency
+#     if any(w in name_lower for w in ['revenue', 'profit', 'cost', 'price', 'sales', 'income', 'expense', 'value', 'spend', 'amount']):
+#         if abs(value) >= 1_000_000_000:
+#             return f"${value / 1_000_000_000:,.2f}B"
+#         if abs(value) >= 1_000_000:
+#             return f"${value / 1_000_000:,.2f}M"
+#         if abs(value) >= 1_000:
+#             return f"${value:,.2f}"
+#         return f"${value:.2f}"
+
+#     # Count
+#     if any(w in name_lower for w in ['count', 'total', 'number', 'orders', 'customers', 'transactions']):
+#         try:
+#             return f"{int(value):,}"
+#         except (ValueError, OverflowError):
+#             return f"{value:,.0f}"
+
+#     # General number
+#     if isinstance(value, float):
+#         try:
+#             if abs(value) < 1e15 and value == int(value):
+#                 return f"{int(value):,}"
+#         except (ValueError, OverflowError):
+#             pass
+#         return f"{value:,.2f}"
+
+#     return str(value)
+
+# def _generate_chart_data(df, chart_spec):
+#     """Execute Pandas aggregation for chart data."""
+#     try:
+#         raw_x = chart_spec.get("x_axis", {}).get("column", "")
+#         raw_y = chart_spec.get("y_axis", {}).get("column", "")
+#         aggregation = chart_spec.get("y_axis", {}).get("aggregation", "SUM").upper()
+#         chart_type = chart_spec.get("chart_type", "").lower()
+#         sort_order = chart_spec.get("sort_order", "")
+
+#         x_col = _find_column(raw_x, df)
+#         y_col = _find_column(raw_y, df)
+
+#         print(f"    x: '{raw_x}' -> '{x_col}' | y: '{raw_y}' -> '{y_col}' | type: {chart_type}")
+
+#         # SCATTER
+#         if chart_type == "scatter":
+#             if x_col and y_col and x_col in df.columns and y_col in df.columns:
+#                 scatter = df[[x_col, y_col]].dropna()
+#                 if pd.api.types.is_numeric_dtype(scatter[x_col]) and pd.api.types.is_numeric_dtype(scatter[y_col]):
+#                     return _to_serializable(
+#                         [{"x": row[x_col], "y": row[y_col]} for _, row in scatter.head(150).iterrows()]
+#                     )
+#             num_cols = df.select_dtypes(include=['number']).columns.tolist()
+#             if len(num_cols) >= 2:
+#                 scatter = df[[num_cols[0], num_cols[1]]].dropna().head(150)
+#                 return _to_serializable(
+#                     [{"x": row[num_cols[0]], "y": row[num_cols[1]]} for _, row in scatter.iterrows()]
+#                 )
+#             return []
+
+#         # HISTOGRAM
+#         if chart_type == "histogram":
+#             target = x_col if x_col and x_col in df.columns else y_col
+#             if target and target in df.columns and pd.api.types.is_numeric_dtype(df[target]):
+#                 counts, edges = np.histogram(df[target].dropna(), bins=10)
+#                 return [{"name": f"{edges[i]:.1f}-{edges[i+1]:.1f}", "value": int(counts[i])} for i in range(len(counts))]
+#             num_cols = df.select_dtypes(include=['number']).columns.tolist()
+#             if num_cols:
+#                 counts, edges = np.histogram(df[num_cols[0]].dropna(), bins=10)
+#                 return [{"name": f"{edges[i]:.1f}-{edges[i+1]:.1f}", "value": int(counts[i])} for i in range(len(counts))]
+#             return []
+
+#         # STANDARD CHARTS
+#         grouped = None
+
+#         if x_col and y_col and x_col in df.columns and y_col in df.columns:
+#             if pd.api.types.is_numeric_dtype(df[y_col]):
+#                 agg_map = {"SUM": "sum", "AVG": "mean", "MEAN": "mean", "AVERAGE": "mean",
+#                            "COUNT": "count", "MAX": "max", "MIN": "min", "MEDIAN": "median"}
+#                 agg_func = agg_map.get(aggregation, "sum")
+#                 grouped = df.groupby(x_col)[y_col].agg(agg_func).reset_index()
+#                 grouped.columns = ['name', 'value']
+#             else:
+#                 grouped = df.groupby(x_col).size().reset_index(name='value')
+#                 grouped = grouped.rename(columns={x_col: 'name'})
+#         elif x_col and x_col in df.columns:
+#             num_cols = df.select_dtypes(include=['number']).columns.tolist()
+#             if num_cols:
+#                 grouped = df.groupby(x_col)[num_cols[0]].sum().reset_index()
+#                 grouped.columns = ['name', 'value']
+#             else:
+#                 grouped = df[x_col].value_counts().reset_index()
+#                 grouped.columns = ['name', 'value']
+#         elif y_col and y_col in df.columns and pd.api.types.is_numeric_dtype(df[y_col]):
+#             cat_cols = df.select_dtypes(include=['object', 'category']).columns.tolist()
+#             if cat_cols:
+#                 grouped = df.groupby(cat_cols[0])[y_col].sum().reset_index()
+#                 grouped.columns = ['name', 'value']
+#         else:
+#             cat_cols = df.select_dtypes(include=['object', 'category']).columns.tolist()
+#             num_cols = df.select_dtypes(include=['number']).columns.tolist()
+#             if cat_cols and num_cols:
+#                 grouped = df.groupby(cat_cols[0])[num_cols[0]].sum().reset_index()
+#                 grouped.columns = ['name', 'value']
+#             elif cat_cols:
+#                 grouped = df[cat_cols[0]].value_counts().reset_index()
+#                 grouped.columns = ['name', 'value']
+#             elif num_cols:
+#                 counts, edges = np.histogram(df[num_cols[0]].dropna(), bins=10)
+#                 return [{"name": f"{edges[i]:.1f}-{edges[i+1]:.1f}", "value": int(counts[i])} for i in range(len(counts))]
+#             else:
+#                 return []
+
+#         if grouped is None:
+#             return []
+
+#         if sort_order == "descending":
+#             grouped = grouped.sort_values('value', ascending=False)
+#         elif sort_order == "ascending":
+#             grouped = grouped.sort_values('value', ascending=True)
+
+#         grouped['name'] = grouped['name'].astype(str)
+#         if pd.api.types.is_numeric_dtype(grouped['value']):
+#             grouped['value'] = grouped['value'].round(2)
+
+#         return _to_serializable(grouped.head(15).to_dict(orient='records'))
+
+#     except Exception as e:
+#         print(f"    [Chart Data] Error: {e}")
+#         return []
+
+
+# # ═══════════════════════════════════════════════════
+# # PHASE 1
+# # ═══════════════════════════════════════════════════
+
+# def _phase_1(df):
+#     """Phase 1: Schema analysis."""
+#     profile = _build_profile(df)
+
+#     # SHORTER prompt to avoid token limit
+#     # Only send first 10 columns if too many
+#     cols_to_send = profile['columns'][:15]
+
+#     prompt = f"""Classify these dataset columns. Rows: {profile['total_rows']}, Cols: {profile['total_columns']}
+
+# Columns: {json.dumps(cols_to_send, indent=1)}
+
+# Sample: {json.dumps(profile['sample_data'][:2], indent=1)}
+
+# Classify each as: metric, dimension, temporal, or identifier.
+# Respond ONLY with JSON:
+# {{
+#   "dataset_profile": {{
+#     "total_rows": {profile['total_rows']},
+#     "total_columns": {profile['total_columns']},
+#     "domain": "domain name",
+#     "data_quality_score": "85%",
+#     "columns": [
+#       {{"column_name": "name", "data_type": "type", "classification": "metric|dimension|temporal|identifier", "business_meaning": "desc", "null_percentage": 0, "unique_values": 0, "sample_values": []}}
+#     ],
+#     "column_classifications": {{
+#       "metrics": [], "dimensions": [], "temporal": [], "identifiers": []
+#     }}
+#   }}
+# }}"""
+
+#     result = _llm_call(prompt)
+#     if result:
+#         result["_numeric_stats"] = profile.get("numeric_stats", {})
+#         result["_categorical_stats"] = profile.get("categorical_stats", {})
+#         result["_all_columns"] = [c["column_name"] for c in profile["columns"]]
+#         result["_temporal_detected"] = profile.get("temporal_detected", [])
+#     return result
+
+
+# # ═══════════════════════════════════════════════════
+# # PHASE 2+3 COMBINED
+# # ═══════════════════════════════════════════════════
+
+# def _phase_2_3_combined(profile_data, numeric_stats):
+#     """Phase 2+3: Generate AND select top 5 KPIs with EXACT column names."""
+#     dp = profile_data.get("dataset_profile", {})
+
+#     # Build explicit column list with types
+#     col_desc = "EXACT COLUMN NAMES IN DATASET:\n"
+#     for col in dp.get("columns", [])[:20]:
+#         col_name = col.get('column_name', '?')
+#         col_class = col.get('classification', '?').upper()
+#         col_desc += f'  - "{col_name}" [{col_class}]'
+#         # Add stats if numeric
+#         if col_name in numeric_stats:
+#             s = numeric_stats[col_name]
+#             col_desc += f' sum={s.get("sum",0)}, mean={s.get("mean",0)}, min={s.get("min",0)}, max={s.get("max",0)}, count={s.get("count",0)}'
+#         col_desc += "\n"
+
+#     numeric_stats_json = json.dumps(numeric_stats, indent=1, default=str)
+#     categorical_json = json.dumps(profile_data.get('_categorical_stats', {}), indent=1, default=str)
+
+#     prompt = f"""You are a Business Analytics Engine. Generate TOP 5 KPIs.
+
+# {col_desc}
+
+# NUMERIC STATS: {numeric_stats_json}
+
+# CATEGORY VALUES: {categorical_json}
+
+# RULES:
+# 1. In "columns_used", you MUST use the EXACT column names shown above in quotes
+# 2. Do NOT rename or modify column names
+# 3. Use formulas that can be computed: SUM, AVG, COUNT, MAX, MIN, DISTINCT
+# 4. For formulas with 2 columns, BOTH must exist in the dataset
+# 5. Generate exactly 5 KPIs
+
+# Respond ONLY with JSON:
+# {{
+#   "selected_kpis": [
+#     {{
+#       "kpi_name": "descriptive name",
+#       "category": "FINANCIAL|OPERATIONAL|GROWTH|CUSTOMER|PERFORMANCE",
+#       "business_meaning": "what it measures",
+#       "formula": "e.g. SUM(Price) or AVG(Quantity) or COUNT(DISTINCT(Customer))",
+#       "columns_used": ["exact_column_name_from_above"],
+#       "strategic_importance": "why it matters",
+#       "priority_score": 90
+#     }}
+#   ]
+# }}"""
+
+#     return _llm_call(prompt)
+
+
+# # ═══════════════════════════════════════════════════
+# # PHASE 4
+# # ═══════════════════════════════════════════════════
+
+# def _phase_4(selected_kpis, numeric_stats, df_columns):
+#     """Phase 4: Formula engineering."""
+#     kpis_json = json.dumps(selected_kpis.get('selected_kpis', []), indent=1, default=str)
+#     columns_json = json.dumps(df_columns, default=str)
+#     stats_json = json.dumps(numeric_stats, indent=1, default=str)
+
+#     prompt = f"""Define computation for these KPIs.
+
+# KPIs: {kpis_json}
+
+# COLUMNS: {columns_json}
+# STATS: {stats_json}
+
+# Use ONLY columns from COLUMNS. Respond ONLY with JSON:
+# {{
+#   "kpis": [
+#     {{
+#       "kpi_id": "KPI-001",
+#       "kpi_name": "name",
+#       "formula": "SUM(ColumnName)",
+#       "columns_used": ["ExactColumnName"],
+#       "computation_method": {{
+#         "python": "df['Col'].sum()",
+#         "sql": "SELECT SUM(Col) FROM data"
+#       }},
+#       "trend_direction": "up|down|stable",
+#       "strategic_priority": "HIGH|MEDIUM|LOW",
+#       "business_insight": "insight",
+#       "actionable_recommendation": "action"
+#     }}
+#   ]
+# }}"""
+
+#     return _llm_call(prompt)
+
+
+# # ═══════════════════════════════════════════════════
+# # PHASE 5
+# # ═══════════════════════════════════════════════════
+# def _phase_5(kpi_specs, df, numeric_stats):
+#     """Phase 5: Compute KPI values with Pandas. Accurate computation."""
+#     computed = []
+#     all_numeric_cols = list(df.select_dtypes(include=['number']).columns)
+#     all_cat_cols = list(df.select_dtypes(include=['object', 'category']).columns)
+
+#     for idx, kpi in enumerate(kpi_specs.get("kpis", [])):
+#         value = None
+#         formula = kpi.get("formula", "").lower()
+#         columns_used = kpi.get("columns_used", [])
+
+#         # Step 1: Resolve actual column names
+#         resolved_cols = []
+#         for col_name in columns_used:
+#             matched = _find_column(col_name, df)
+#             if matched:
+#                 resolved_cols.append(matched)
+
+#         # Step 2: Try direct formula computation
+#         if resolved_cols:
+#             try:
+#                 first_col = resolved_cols[0]
+
+#                 # MULTIPLICATION + SUM: SUM(A * B)
+#                 if len(resolved_cols) >= 2 and any(op in formula for op in ["*", "×", "multiply"]):
+#                     c1, c2 = resolved_cols[0], resolved_cols[1]
+#                     if pd.api.types.is_numeric_dtype(df[c1]) and pd.api.types.is_numeric_dtype(df[c2]):
+#                         if "avg" in formula or "mean" in formula or "average" in formula:
+#                             value = round(float((df[c1] * df[c2]).mean()), 2)
+#                         else:
+#                             value = float((df[c1] * df[c2]).sum())
+
+#                 # RATIO / DIVISION: A / B
+#                 elif len(resolved_cols) >= 2 and any(op in formula for op in ["/", "ratio", "margin", "percentage", "%"]):
+#                     c1, c2 = resolved_cols[0], resolved_cols[1]
+#                     if pd.api.types.is_numeric_dtype(df[c1]) and pd.api.types.is_numeric_dtype(df[c2]):
+#                         denom = df[c2].sum()
+#                         if denom != 0:
+#                             value = round(float(df[c1].sum() / denom * 100), 2)
+
+#                 # SUBTRACTION: A - B
+#                 elif len(resolved_cols) >= 2 and "-" in formula and "sub" not in formula:
+#                     c1, c2 = resolved_cols[0], resolved_cols[1]
+#                     if pd.api.types.is_numeric_dtype(df[c1]) and pd.api.types.is_numeric_dtype(df[c2]):
+#                         value = float(df[c1].sum() - df[c2].sum())
+
+#                 # COUNT DISTINCT
+#                 elif "distinct" in formula or "unique" in formula:
+#                     value = int(df[first_col].nunique())
+
+#                 # COUNT
+#                 elif "count" in formula and "distinct" not in formula:
+#                     value = int(df[first_col].count())
+
+#                 # AVG / MEAN
+#                 elif any(w in formula for w in ["avg", "average", "mean"]):
+#                     if pd.api.types.is_numeric_dtype(df[first_col]):
+#                         value = round(float(df[first_col].mean()), 2)
+
+#                 # MAX
+#                 elif any(w in formula for w in ["max", "highest", "maximum"]):
+#                     if pd.api.types.is_numeric_dtype(df[first_col]):
+#                         value = float(df[first_col].max())
+
+#                 # MIN
+#                 elif any(w in formula for w in ["min", "lowest", "minimum"]):
+#                     if pd.api.types.is_numeric_dtype(df[first_col]):
+#                         value = float(df[first_col].min())
+
+#                 # SUM (default for numeric)
+#                 elif "sum" in formula or "total" in formula:
+#                     if pd.api.types.is_numeric_dtype(df[first_col]):
+#                         value = float(df[first_col].sum())
+
+#                 # MEDIAN
+#                 elif "median" in formula:
+#                     if pd.api.types.is_numeric_dtype(df[first_col]):
+#                         value = float(df[first_col].median())
+
+#                 # Fallback: if numeric column, do SUM
+#                 elif pd.api.types.is_numeric_dtype(df[first_col]):
+#                     value = float(df[first_col].sum())
+
+#             except Exception as e:
+#                 print(f"  [KPI Compute] Error for '{kpi.get('kpi_name', '?')}': {e}")
+
+#         # Step 3: Fallback using numeric_stats
+#         if value is None:
+#             for col_name in columns_used:
+#                 for stat_key in numeric_stats:
+#                     if (stat_key.lower() == col_name.lower() or
+#                         col_name.lower() in stat_key.lower() or
+#                         stat_key.lower() in col_name.lower()):
+#                         s = numeric_stats[stat_key]
+#                         if any(w in formula for w in ["avg", "mean", "average"]):
+#                             value = s.get("mean")
+#                         elif any(w in formula for w in ["max", "highest"]):
+#                             value = s.get("max")
+#                         elif any(w in formula for w in ["min", "lowest"]):
+#                             value = s.get("min")
+#                         elif "count" in formula:
+#                             value = s.get("count")
+#                         else:
+#                             value = s.get("sum")
+#                         if value is not None:
+#                             break
+#                 if value is not None:
+#                     break
+
+#         # Step 4: Last resort using KPI name
+#         if value is None:
+#             kpi_name_lower = kpi.get("kpi_name", "").lower()
+#             if any(w in kpi_name_lower for w in ["count", "number of", "total transactions", "total orders", "total records"]):
+#                 value = len(df)
+#             elif any(w in kpi_name_lower for w in ["unique", "distinct"]):
+#                 if all_cat_cols:
+#                     value = int(df[all_cat_cols[0]].nunique())
+#                 elif all_numeric_cols:
+#                     value = int(df[all_numeric_cols[0]].nunique())
+#             elif all_numeric_cols:
+#                 if any(w in kpi_name_lower for w in ["average", "avg", "mean"]):
+#                     value = round(float(df[all_numeric_cols[0]].mean()), 2)
+#                 elif any(w in kpi_name_lower for w in ["max", "highest", "peak", "top"]):
+#                     value = float(df[all_numeric_cols[0]].max())
+#                 elif any(w in kpi_name_lower for w in ["min", "lowest", "bottom"]):
+#                     value = float(df[all_numeric_cols[0]].min())
+#                 else:
+#                     value = float(df[all_numeric_cols[0]].sum())
+
+#         value = _safe_value(value)
+#         name = kpi.get("kpi_name", f"KPI {idx+1}")
+#         computed.append({
+#             "kpi_id": kpi.get("kpi_id", f"KPI-{idx+1:03d}"),
+#             "kpi_name": name,
+#             "kpi_value": _format_kpi_value(value, name),
+#             "kpi_value_raw": value if value is not None else 0,
+#             "trend_direction": kpi.get("trend_direction", "stable"),
+#             "formula": kpi.get("formula", ""),
+#             "columns_used": kpi.get("columns_used", []),
+#             "computation_method": kpi.get("computation_method", {}),
+#             "business_insight": kpi.get("business_insight", ""),
+#             "actionable_recommendation": kpi.get("actionable_recommendation", ""),
+#             "strategic_priority": kpi.get("strategic_priority", "MEDIUM"),
+#         })
+
+#     return {"kpis": computed[:5]}
+
+# # ═══════════════════════════════════════════════════
+# # PHASE 6+7 COMBINED
+# # ═══════════════════════════════════════════════════
+
+# def _phase_6_7_combined(profile_data, computed_kpis):
+#     """Phase 6+7: Generate AND select top 6 charts."""
+#     dp = profile_data.get("dataset_profile", {})
+#     classifications = dp.get("column_classifications", {})
+
+#     metrics_json = json.dumps(classifications.get('metrics', []), default=str)
+#     dimensions_json = json.dumps(classifications.get('dimensions', []), default=str)
+#     temporal_json = json.dumps(classifications.get('temporal', []), default=str)
+
+#     kpi_list = []
+#     for k in computed_kpis.get("kpis", []):
+#         kpi_list.append({"name": k.get("kpi_name", ""), "value": k.get("kpi_value", "N/A")})
+#     kpis_json = json.dumps(kpi_list, indent=1, default=str)
+
+#     prompt = f"""Select 6 charts for a dashboard.
+
+# METRICS: {metrics_json}
+# DIMENSIONS: {dimensions_json}
+# TEMPORAL: {temporal_json}
+# KPIs: {kpis_json}
+
+# Types: bar, line, pie, donut, area, scatter, histogram
+# Include variety: 1 line/area, 1 bar, 1 pie/donut, 1 scatter/histogram.
+# Use ONLY column names from METRICS, DIMENSIONS, TEMPORAL.
+
+# Respond ONLY with JSON:
+# {{
+#   "charts": [
+#     {{
+#       "chart_id": "CHART-001",
+#       "chart_type": "bar",
+#       "title": "Title",
+#       "x_axis": {{"column": "ExactCol", "label": "Label"}},
+#       "y_axis": {{"column": "ExactCol", "label": "Label", "aggregation": "SUM"}},
+#       "group_by": null,
+#       "sort_order": "descending",
+#       "business_insight": "insight",
+#       "actionable_recommendation": "action"
+#     }}
+#   ]
+# }}"""
+
+#     return _llm_call(prompt)
+
+
+# # ═══════════════════════════════════════════════════
+# # PHASE 8
+# # ═══════════════════════════════════════════════════
+
+# def _phase_8(df, charts_spec):
+#     """Phase 8: Generate chart data with Pandas."""
+#     charts = charts_spec.get("charts", [])
+
+#     for chart in charts:
+#         chart["data"] = _generate_chart_data(df, chart)
+
+#         if not chart["data"]:
+#             print(f"  [Phase 8] Fallback for: {chart.get('title', '?')}")
+#             chart_type = chart.get("chart_type", "").lower()
+#             cat_cols = df.select_dtypes(include=['object', 'category']).columns.tolist()
+#             num_cols = df.select_dtypes(include=['number']).columns.tolist()
+
+#             try:
+#                 if chart_type in ["pie", "donut"] and cat_cols:
+#                     vc = df[cat_cols[0]].value_counts().head(8).reset_index()
+#                     vc.columns = ['name', 'value']
+#                     vc['name'] = vc['name'].astype(str)
+#                     chart["data"] = _to_serializable(vc.to_dict(orient='records'))
+
+#                 elif chart_type in ["line", "area"] and num_cols:
+#                     series = df[num_cols[0]].dropna().head(30).reset_index()
+#                     series.columns = ['name', 'value']
+#                     series['name'] = series['name'].astype(str)
+#                     chart["data"] = _to_serializable(series.to_dict(orient='records'))
+
+#                 elif chart_type == "histogram" and num_cols:
+#                     counts, edges = np.histogram(df[num_cols[0]].dropna(), bins=10)
+#                     chart["data"] = [{"name": f"{edges[i]:.1f}-{edges[i+1]:.1f}", "value": int(counts[i])} for i in range(len(counts))]
+
+#                 elif chart_type == "scatter" and len(num_cols) >= 2:
+#                     scatter = df[[num_cols[0], num_cols[1]]].dropna().head(100)
+#                     chart["data"] = _to_serializable([{"x": row[num_cols[0]], "y": row[num_cols[1]]} for _, row in scatter.iterrows()])
+
+#                 elif cat_cols and num_cols:
+#                     grouped = df.groupby(cat_cols[0])[num_cols[0]].sum().reset_index()
+#                     grouped.columns = ['name', 'value']
+#                     grouped = grouped.sort_values('value', ascending=False).head(10)
+#                     grouped['name'] = grouped['name'].astype(str)
+#                     chart["data"] = _to_serializable(grouped.to_dict(orient='records'))
+
+#                 elif cat_cols:
+#                     vc = df[cat_cols[0]].value_counts().head(10).reset_index()
+#                     vc.columns = ['name', 'value']
+#                     vc['name'] = vc['name'].astype(str)
+#                     chart["data"] = _to_serializable(vc.to_dict(orient='records'))
+
+#             except Exception as e:
+#                 print(f"  [Phase 8] Fallback failed: {e}")
+#                 chart["data"] = []
+
+#     charts_spec["charts"] = [c for c in charts if c.get("data")]
+#     charts_spec["charts"] = charts_spec["charts"][:6]
+#     return charts_spec
+
+
+# # ═══════════════════════════════════════════════════
+# # PHASE 9
+# # ═══════════════════════════════════════════════════
+
+# def _phase_9(profile_data, computed_kpis, charts_with_data, df):
+#     """Phase 9: Assemble final output."""
+#     dp = profile_data.get("dataset_profile", {})
+
+#     insights = []
+#     for idx, kpi in enumerate(computed_kpis.get("kpis", [])):
+#         if kpi.get("business_insight"):
+#             insights.append({
+#                 "insight_id": f"INS-{idx+1:03d}",
+#                 "insight": kpi["business_insight"],
+#                 "impact_level": kpi.get("strategic_priority", "MEDIUM"),
+#                 "recommended_action": kpi.get("actionable_recommendation", "Review this metric regularly.")
+#             })
+
+#     for chart in charts_with_data.get("charts", []):
+#         if chart.get("business_insight") and len(insights) < 6:
+#             insights.append({
+#                 "insight_id": f"INS-{len(insights)+1:03d}",
+#                 "insight": chart["business_insight"],
+#                 "impact_level": "MEDIUM",
+#                 "recommended_action": chart.get("actionable_recommendation", "Monitor this trend.")
+#             })
+
+#     kpi_summaries = [f"{k['kpi_name']}: {k['kpi_value']}" for k in computed_kpis.get("kpis", [])[:3]]
+#     executive_summary = (
+#         f"Analysis of {dp.get('total_rows', 0):,} records in the {dp.get('domain', 'business')} domain. "
+#         f"Key metrics: {', '.join(kpi_summaries)}. "
+#         f"{len(charts_with_data.get('charts', []))} visualizations generated."
+#     )
+
+#     date_range = ""
+#     for col in profile_data.get("_temporal_detected", []):
+#         if col in df.columns:
+#             try:
+#                 dates = pd.to_datetime(df[col], errors='coerce').dropna()
+#                 if len(dates) > 0:
+#                     date_range = f"{dates.min().strftime('%Y-%m-%d')} to {dates.max().strftime('%Y-%m-%d')}"
+#                     break
+#             except Exception:
+#                 pass
+
+#     quality_notes = []
+#     for col_info in dp.get("columns", []):
+#         null_pct = col_info.get("null_percentage", 0)
+#         if isinstance(null_pct, (int, float)) and null_pct > 5:
+#             quality_notes.append(f"Column '{col_info['column_name']}' has {null_pct}% missing values.")
+#     if not quality_notes:
+#         quality_notes.append("Data quality is good.")
+
+#     return _to_serializable({
+#         "solven_analytics_output": {
+#             "version": "2.0",
+#             "analysis_timestamp": datetime.datetime.now().isoformat(),
+#             "dataset_summary": {
+#                 "total_rows": dp.get("total_rows", len(df)),
+#                 "total_columns": dp.get("total_columns", len(df.columns)),
+#                 "domain": dp.get("domain", "General"),
+#                 "date_range": date_range,
+#                 "data_quality_score": dp.get("data_quality_score", "N/A"),
+#                 "column_classifications": dp.get("column_classifications", {}),
+#             },
+#             "kpis": computed_kpis.get("kpis", []),
+#             "charts": charts_with_data.get("charts", []),
+#             "key_business_insights": insights[:5],
+#             "executive_summary": executive_summary,
+#             "data_quality_notes": quality_notes,
+#         }
+#     })
+
+
+# # ═══════════════════════════════════════════════════
+# # MAIN ENTRY POINT
+# # ═══════════════════════════════════════════════════
+
+# def run_solven_analytics_pipeline(dataset_path):
+#     """Main entry point called by analytics_views.py."""
+#     try:
+#         _set_phase(0, "Starting", "Loading data...")
+
+#         # Load
+#         if dataset_path.endswith('.csv'):
+#             try:
+#                 df = pd.read_csv(dataset_path, encoding="utf-8")
+#             except UnicodeDecodeError:
+#                 df = pd.read_csv(dataset_path, encoding="latin1")
+#         elif dataset_path.endswith(('.xlsx', '.xls')):
+#             df = pd.read_excel(dataset_path)
+#         else:
+#             _set_error("Unsupported file format")
+#             return {"error": "Unsupported file format. Upload CSV or Excel."}
+
+#         if df.empty:
+#             _set_error("Empty file")
+#             return {"error": "The uploaded file contains no data."}
+
+#         df.columns = df.columns.str.strip()
+#         print(f"[Data] {len(df)} rows x {len(df.columns)} columns")
+
+#         numeric_stats = {}
+#         for col in df.select_dtypes(include=['number']).columns:
+#             try:
+#                 numeric_stats[col] = {
+#                     "sum": float(df[col].sum()) if pd.notnull(df[col].sum()) else 0,
+#                     "mean": round(float(df[col].mean()), 2) if pd.notnull(df[col].mean()) else 0,
+#                     "min": float(df[col].min()) if pd.notnull(df[col].min()) else 0,
+#                     "max": float(df[col].max()) if pd.notnull(df[col].max()) else 0,
+#                     "count": int(df[col].count()),
+#                 }
+#             except Exception:
+#                 pass
+
+#         df_columns = list(df.columns)
+
+#         # PHASE 1
+#         _set_phase(1, "Data Profiling", "LLM Call 1/4")
+#         profile_data = _phase_1(df)
+#         if not profile_data or "dataset_profile" not in profile_data:
+#             print("[Phase 1] Using fallback profile")
+#             profile_data = {
+#                 "dataset_profile": {
+#                     "total_rows": len(df), "total_columns": len(df.columns),
+#                     "domain": "General", "data_quality_score": "N/A",
+#                     "columns": [
+#                         {"column_name": c,
+#                          "classification": "metric" if pd.api.types.is_numeric_dtype(df[c]) else "dimension",
+#                          "null_percentage": round(float(df[c].isnull().sum() / len(df) * 100), 2)}
+#                         for c in df.columns
+#                     ],
+#                     "column_classifications": {
+#                         "metrics": list(df.select_dtypes(include=['number']).columns),
+#                         "dimensions": list(df.select_dtypes(include=['object', 'category']).columns),
+#                         "temporal": [], "identifiers": [],
+#                     }
+#                 },
+#                 "_numeric_stats": numeric_stats, "_categorical_stats": {},
+#                 "_all_columns": df_columns, "_temporal_detected": [],
+#             }
+#         print("[Phase 1] Done")
+
+#         # PHASE 2+3
+#         _set_phase(2, "KPI Generation", "LLM Call 2/4")
+#         selected_kpis = _phase_2_3_combined(profile_data, numeric_stats)
+#         if not selected_kpis or not selected_kpis.get("selected_kpis"):
+#             _set_error("Could not generate KPIs")
+#             return {"error": "Could not generate KPIs from this dataset."}
+#         _set_phase(3, "KPI Prioritization", "Selected top 5")
+#         print(f"[Phase 2-3] Selected {len(selected_kpis['selected_kpis'])} KPIs")
+
+#         # PHASE 4
+#         _set_phase(4, "Formula Engineering", "LLM Call 3/4")
+#         kpi_formulas = _phase_4(selected_kpis, numeric_stats, df_columns)
+#         if not kpi_formulas or not kpi_formulas.get("kpis"):
+#             _set_error("Could not engineer formulas")
+#             return {"error": "Could not engineer KPI formulas."}
+#         print("[Phase 4] Done")
+
+#         # PHASE 5
+#         _set_phase(5, "KPI Computation", "Computing with Pandas")
+#         computed_kpis = _phase_5(kpi_formulas, df, numeric_stats)
+#         for kpi in computed_kpis.get("kpis", []):
+#             print(f"  -> {kpi['kpi_name']}: {kpi['kpi_value']}")
+#         print("[Phase 5] Done")
+
+#         # PHASE 6+7
+#         _set_phase(6, "Chart Ideation", "LLM Call 4/4")
+#         selected_charts = _phase_6_7_combined(profile_data, computed_kpis)
+#         if not selected_charts or not selected_charts.get("charts"):
+#             _set_error("Could not generate charts")
+#             return {"error": "Could not generate charts."}
+#         _set_phase(7, "Chart Selection", "Selected top 6")
+#         print(f"[Phase 6-7] Selected {len(selected_charts['charts'])} charts")
+
+#         # PHASE 8
+#         _set_phase(8, "Chart Data Generation", "Aggregating with Pandas")
+#         charts_with_data = _phase_8(df, selected_charts)
+#         for chart in charts_with_data.get("charts", []):
+#             print(f"  -> {chart.get('title', '?')}: {len(chart.get('data', []))} points")
+#         print("[Phase 8] Done")
+
+#         # PHASE 9
+#         _set_phase(9, "Final Consolidation", "Assembling output")
+#         final = _phase_9(profile_data, computed_kpis, charts_with_data, df)
+#         _set_complete()
+
+#         print("\n[Solven Analytics v2.0] Pipeline Complete!")
+#         return final
+
+#     except Exception as e:
+#         print(f"\n[ERROR] {e}")
+#         traceback.print_exc()
+#         _set_error(str(e))
+#         return {"error": f"Pipeline failed: {str(e)}"}
+
+
+
+# # ===================================================================
+# # ANALYTICS MAIN ENTRY POINT
+# # ===================================================================
+
+# def run_solven_analytics_pipeline(dataset_path):
+#     """Main entry point for analytics pipeline. Called by analytics_views.py."""
+#     try:
+#         _set_phase(0, "Starting", "Loading data...")
+
+#         # Load file
+#         if dataset_path.endswith('.csv'):
+#             try:
+#                 df = pd.read_csv(dataset_path, encoding="utf-8")
+#             except UnicodeDecodeError:
+#                 df = pd.read_csv(dataset_path, encoding="latin1")
+#         elif dataset_path.endswith(('.xlsx', '.xls')):
+#             df = pd.read_excel(dataset_path)
+#         else:
+#             _set_error("Unsupported file format")
+#             return {"error": "Unsupported file format. Upload CSV or Excel."}
+
+#         if df.empty:
+#             _set_error("Empty file")
+#             return {"error": "The uploaded file contains no data."}
+
+#         df.columns = df.columns.str.strip()
+#         print(f"[Data] {len(df)} rows x {len(df.columns)} columns")
+
+#         numeric_stats = {}
+#         for col in df.select_dtypes(include=['number']).columns:
+#             try:
+#                 numeric_stats[col] = {
+#                     "sum": float(df[col].sum()) if pd.notnull(df[col].sum()) else 0,
+#                     "mean": round(float(df[col].mean()), 2) if pd.notnull(df[col].mean()) else 0,
+#                     "min": float(df[col].min()) if pd.notnull(df[col].min()) else 0,
+#                     "max": float(df[col].max()) if pd.notnull(df[col].max()) else 0,
+#                     "count": int(df[col].count()),
+#                 }
+#             except Exception:
+#                 pass
+
+#         df_columns = list(df.columns)
+
+#         # PHASE 1
+#         _set_phase(1, "Data Profiling", "LLM Call 1/4")
+#         profile_data = _phase_1(df)
+#         if not profile_data or "dataset_profile" not in profile_data:
+#             print("[Phase 1] Using fallback profile")
+#             profile_data = {
+#                 "dataset_profile": {
+#                     "total_rows": len(df),
+#                     "total_columns": len(df.columns),
+#                     "domain": "General",
+#                     "data_quality_score": "N/A",
+#                     "columns": [
+#                         {
+#                             "column_name": c,
+#                             "classification": (
+#                                 "metric" if pd.api.types.is_numeric_dtype(df[c])
+#                                 else "dimension"
+#                             ),
+#                             "null_percentage": round(
+#                                 float(df[c].isnull().sum() / len(df) * 100), 2
+#                             ),
+#                         }
+#                         for c in df.columns
+#                     ],
+#                     "column_classifications": {
+#                         "metrics": list(df.select_dtypes(include=['number']).columns),
+#                         "dimensions": list(
+#                             df.select_dtypes(include=['object', 'category']).columns
+#                         ),
+#                         "temporal": [],
+#                         "identifiers": [],
+#                     },
+#                 },
+#                 "_numeric_stats": numeric_stats,
+#                 "_categorical_stats": {},
+#                 "_all_columns": df_columns,
+#                 "_temporal_detected": [],
+#             }
+#         print("[Phase 1] Done")
+
+#         # PHASE 2+3
+#         _set_phase(2, "KPI Generation", "LLM Call 2/4")
+#         selected_kpis = _phase_2_3_combined(profile_data, numeric_stats)
+#         if not selected_kpis or not selected_kpis.get("selected_kpis"):
+#             _set_error("Could not generate KPIs")
+#             return {"error": "Could not generate KPIs from this dataset."}
+#         _set_phase(3, "KPI Prioritization", "Selected top 5")
+#         print(f"[Phase 2-3] Selected {len(selected_kpis['selected_kpis'])} KPIs")
+
+#         # PHASE 4
+#         _set_phase(4, "Formula Engineering", "LLM Call 3/4")
+#         kpi_formulas = _phase_4(selected_kpis, numeric_stats, df_columns)
+#         if not kpi_formulas or not kpi_formulas.get("kpis"):
+#             _set_error("Could not engineer formulas")
+#             return {"error": "Could not engineer KPI formulas."}
+#         print("[Phase 4] Done")
+
+#         # PHASE 5
+#         _set_phase(5, "KPI Computation", "Computing with Pandas")
+#         computed_kpis = _phase_5(kpi_formulas, df, numeric_stats)
+#         for kpi in computed_kpis.get("kpis", []):
+#             print(f"  -> {kpi['kpi_name']}: {kpi['kpi_value']}")
+#         print("[Phase 5] Done")
+
+#         # PHASE 6+7
+#         _set_phase(6, "Chart Ideation", "LLM Call 4/4")
+#         selected_charts = _phase_6_7_combined(profile_data, computed_kpis)
+#         if not selected_charts or not selected_charts.get("charts"):
+#             _set_error("Could not generate charts")
+#             return {"error": "Could not generate charts."}
+#         _set_phase(7, "Chart Selection", "Selected top 6")
+#         print(f"[Phase 6-7] Selected {len(selected_charts['charts'])} charts")
+
+#         # PHASE 8
+#         _set_phase(8, "Chart Data Generation", "Aggregating with Pandas")
+#         charts_with_data = _phase_8(df, selected_charts)
+#         for chart in charts_with_data.get("charts", []):
+#             print(f"  -> {chart.get('title', '?')}: {len(chart.get('data', []))} points")
+#         print("[Phase 8] Done")
+
+#         # PHASE 9
+#         _set_phase(9, "Final Consolidation", "Assembling output")
+#         final = _phase_9(profile_data, computed_kpis, charts_with_data, df)
+#         _set_complete()
+
+#         print("\n[Solven Analytics v2.0] Pipeline Complete!")
+#         return final
+
+#     except Exception as e:
+#         print(f"\n[ERROR] {e}")
+#         traceback.print_exc()
+#         _set_error(str(e))
+#         return {"error": f"Pipeline failed: {str(e)}"}
+
+
+# # ===================================================================
+# # ===================================================================
+# #
+# #   RAG QUERY SYSTEM — Hybrid Search + SQL + Knowledge Retrieval
+# #
+# # ===================================================================
+# # ===================================================================
+
+
+# def similarity_search(query, top_k=3):
+#     """
+#     Hybrid Search: Combines Vector Search (Semantic) + Keyword Search (Exact Match).
+#     Requires pgvector extension and document_chunks table.
+#     """
+#     query_embedding = generate_embedding(query)
+
+#     # 1. Vector Search (Semantic)
+#     with connection.cursor() as cursor:
+#         cursor.execute("""
+#             SELECT content, metadata, (embedding <=> %s::vector) as distance
+#             FROM document_chunks
+#             ORDER BY distance
+#             LIMIT %s
+#         """, [query_embedding, top_k])
+#         vector_results = cursor.fetchall()
+
+#     # 2. Keyword Search (Full-Text Search)
+#     with connection.cursor() as cursor:
+#         cursor.execute("""
+#             SELECT content, metadata, 0.0 as distance
+#             FROM document_chunks
+#             WHERE to_tsvector('english', content) @@ plainto_tsquery('english', %s)
+#             LIMIT %s
+#         """, [query, top_k])
+#         keyword_results = cursor.fetchall()
+
+#     # 3. Combine & Deduplicate
+#     combined_results = {}
+
+#     for row in vector_results:
+#         combined_results[row[0]] = {
+#             "content": row[0],
+#             "metadata": row[1],
+#             "distance": row[2],
+#         }
+
+#     for row in keyword_results:
+#         if row[0] not in combined_results:
+#             combined_results[row[0]] = {
+#                 "content": row[0],
+#                 "metadata": row[1],
+#                 "distance": 0.0,
+#             }
+
+#     final_results = list(combined_results.values())
+#     final_results.sort(key=lambda x: x['distance'])
+
+#     return final_results[:top_k]
+
+
+# def rag_query(question, chat_history=None):
+#     """
+#     Main RAG query handler.
+#     Routes to: Database (SQL) | Knowledge (RAG) | Conversational | Irrelevant.
+#     """
+
+#     # -------------------------
+#     # 0. Contextualize Question (Memory)
+#     # -------------------------
+#     search_query = question
+
+#     if chat_history and len(chat_history) > 0:
+#         history_text = "\n".join([
+#             f"{msg['role']}: {msg['content']}"
+#             for msg in chat_history[-4:]
+#         ])
+
+#         rewrite_prompt = f"""
+# Given the following conversation history and a follow-up question, rephrase the follow-up question to be a standalone question that can be understood without the history.
+
+# Chat History:
+# {history_text}
+
+# Follow-up Question: {question}
+
+# Standalone Question:
+# """
+#         rewritten = generate_response(rewrite_prompt).strip()
+
+#         if "Standalone Question:" in rewritten:
+#             rewritten = rewritten.split("Standalone Question:")[-1].strip()
+
+#         print(f"DEBUG: Original: '{question}' -> Rewritten: '{rewritten}'")
+#         search_query = rewritten
+
+#     # -------------------------
+#     # 1. Classify question
+#     # -------------------------
+#     classification_prompt = f"""
+# Classify the user's question into ONE of the following categories:
+
+# database: For questions about Titanic passengers, such as counts, details, ages, survival, fares, or lists (e.g., "show me details of women", "how many men").
+# knowledge: For questions about company policy, employment, leave, travel, office environment, or any specific terms defined in the documents.
+# conversational: ONLY for greetings (hello, hi) or simple pleasantries.
+# irrelevant: For questions completely unrelated to the Titanic dataset or company policy.
+# Return ONLY one word.
+
+# Question:
+# {search_query}
+# """
+
+#     question_type = generate_response(classification_prompt).strip().lower()
+#     print(f"DEBUG: Question '{search_query}' classified as: {question_type}")
+
+#     # -------------------------
+#     # 2. Database -> Generate SQL
+#     # -------------------------
+#     if "database" in question_type:
+
+#         sql_prompt = f"""
+# You are a PostgreSQL expert tasked with converting natural language questions into PostgreSQL queries for the 'titanic' table.
+
+# Table Schema:
+
+# table_name: titanic
+# columns:
+# survived: INTEGER (0 = No, 1 = Yes)
+# pclass: INTEGER (Passenger Class: 1, 2, 3)
+# sex: TEXT ('male', 'female')
+# age: FLOAT (can be NULL)
+# sibsp: INTEGER (Number of Siblings/Spouses Aboard)
+# parch: INTEGER (Number of Parents/Children Aboard)
+# fare: FLOAT
+# embarked: TEXT (Port of Embarkation: 'C' = Cherbourg, 'Q' = Queenstown, 'S' = Southampton)
+
+# STRICT RULES:
+# - Return ONLY raw SQL. No markdown, no explanations, just the query.
+# - Use exact column names and values (e.g., sex = 'female', not 'woman').
+# - When filtering by age, always exclude NULLs (e.g., WHERE age IS NOT NULL AND ...).
+# - For general counts of passengers, use COUNT(*).
+# - For questions about survival, use survived = 1. For non-survival, use survived = 0.
+# - Do NOT add survived = 1 unless the user explicitly asks about survival.
+# - Map 'women'/'woman' to sex = 'female' and 'men'/'man' to sex = 'male'.
+
+# Examples:
+
+# User Question: "How many passengers survived?"
+# SQL Query: SELECT COUNT(*) FROM titanic WHERE survived = 1;
+
+# User Question: "What is the total count of passengers?"
+# SQL Query: SELECT COUNT(*) FROM titanic;
+
+# User Question: "how many passengers were in pclass 1"
+# SQL Query: SELECT COUNT(*) FROM titanic WHERE pclass = 1;
+
+# User Question: "count of male and female passengers"
+# SQL Query: SELECT sex, COUNT(*) FROM titanic GROUP BY sex;
+
+# User Question: "give me details of women age group between 20 to 50"
+# SQL Query: SELECT * FROM titanic WHERE sex = 'female' AND age BETWEEN 20 AND 50;
+
+# User Question:
+# {search_query}
+
+# SQL Query:
+# """
+
+#         sql_query = generate_response(sql_prompt).strip()
+
+#         # Remove markdown formatting if LLM adds it
+#         match = re.search(
+#             r"```(?:sql)?\s*(.*?)```", sql_query, re.DOTALL | re.IGNORECASE
+#         )
+#         if match:
+#             sql_query = match.group(1).strip()
+#         else:
+#             sql_query = sql_query.replace("```sql", "").replace("```", "").strip()
+
+#         # Safety check
+#         forbidden_keywords = ["drop", "delete", "update", "insert", "alter", "truncate"]
+#         if any(keyword in sql_query.lower() for keyword in forbidden_keywords):
+#             return "Unsafe query detected."
+
+#         try:
+#             with connection.cursor() as cursor:
+#                 cursor.execute(sql_query)
+#                 result = cursor.fetchall()
+
+#             if not result:
+#                 return "No records found."
+
+#             if len(result) == 1 and len(result[0]) == 1:
+#                 return f"The answer is {result[0][0]}."
+
+#             return f"Query Result: {result}"
+
+#         except Exception as e:
+#             return f"Error executing generated SQL: {str(e)}"
+
+#     # -------------------------
+#     # 3. Knowledge -> Use RAG
+#     # -------------------------
+#     if "knowledge" in question_type:
+
+#         docs = similarity_search(search_query, top_k=5)
+
+#         if not docs:
+#             return "No relevant information found."
+
+#         context = "\n\n".join([doc["content"] for doc in docs])
+
+#         prompt = f"""You are a helpful assistant. Your task is to answer the user's question based *only* on the provided context.
+# Do not mention the context in your answer. Just provide the answer directly.
+# If the information is not in the context, state that the answer is not available in the provided data.
+
+# Context:
+# {context}
+
+# User's Question:
+# {search_query}
+
+# Answer:
+# """
+
+#         return generate_response(prompt)
+
+#     # -------------------------
+#     # 3b. Conversational
+#     # -------------------------
+#     if "conversational" in question_type:
+#         return generate_response(
+#             f"Respond politely to this conversational input: {search_query}"
+#         )
+
+#     # -------------------------
+#     # 4. Irrelevant
+#     # -------------------------
+#     return "Please ask a question related to the dataset."
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 # """
 # Solven Analytics Engine v2.0 — Core 9-Phase Analytical Pipeline

@@ -1,10 +1,35 @@
-Django==4.2.7
-djangorestframework==3.14.0
-django-cors-headers==4.3.1
-google-generativeai==0.8.3
-python-dotenv==1.0.0
-psycopg2-binary==2.9.9
-PyPDF2==3.0.1
-requests==2.31.0
-pandas
-openpyxl
+# requirements.txt — ADD these lines to your existing file
+
+# NLP & Chunking
+spacy==3.7.4
+nltk==3.8.1
+
+# Document Parsing
+PyMuPDF==1.24.3
+python-docx==1.1.0
+pdfplumber==0.11.0
+openpyxl==3.1.2
+
+# Background Processing
+celery==5.3.6
+redis==5.0.1
+
+# ML Utilities
+scikit-learn==1.4.0
+numpy>=1.24.0
+
+# Keyword Extraction
+rake-nltk==1.0.6
+
+
+
+#Django==4.2.7
+#djangorestframework==3.14.0
+#django-cors-headers==4.3.1
+#google-generativeai==0.8.3
+#python-dotenv==1.0.0
+#psycopg2-binary==2.9.9
+#PyPDF2==3.0.1
+#requests==2.31.0
+#pandas
+#openpyxl

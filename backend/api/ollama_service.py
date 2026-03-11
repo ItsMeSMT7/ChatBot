@@ -1,37 +1,75 @@
-import requests
+import re
 import json
+import logging
+import requests
+
+"""
+Communication with local Ollama instance.
+Handles embeddings and text generation.
+"""
+
+logger = logging.getLogger(__name__)
 
 OLLAMA_BASE_URL = "http://localhost:11434"
+EMBEDDING_MODEL = "nomic-embed-text"
 LLM_MODEL = "gemma3:1b"  # MUST match an installed model (check with `ollama list`)
 
 
 def generate_embedding(text):
     """
-    WHAT: Converts text into a 768-dimensional vector
-    WHY: Vectors allow mathematical similarity comparison between texts
-
-    Embeddings are numerical representations of text where similar meanings
-    have similar vector values. This enables semantic search.
+    Convert text into a 768-dimensional vector.
+    Used when STORING document chunks.
     """
     try:
         response = requests.post(
             f"{OLLAMA_BASE_URL}/api/embeddings",
             json={
-                "model": "nomic-embed-text",
-                "prompt": text
-            }
+                "model": EMBEDDING_MODEL,
+                "prompt": f"search_document: {text}",
+            },
+            timeout=30,
         )
         response.raise_for_status()
-        return response.json()["embedding"]
-    except requests.exceptions.HTTPError as e:
-        if e.response.status_code == 404:
-            raise Exception(
-                "Embedding model 'nomic-embed-text' not found. "
-                "Please run: ollama pull nomic-embed-text"
-            )
-        raise Exception(f"Embedding generation failed: {str(e)}")
+        embedding = response.json().get("embedding")
+        if not embedding:
+            logger.error("Ollama returned empty embedding")
+            return None
+        return embedding
+    except requests.exceptions.ConnectionError:
+        logger.error("Cannot connect to Ollama. Is it running?")
+        return None
     except Exception as e:
-        raise Exception(f"Embedding generation failed: {str(e)}")
+        logger.error(f"Embedding failed: {e}")
+        return None
+
+
+# ────────────────────────────────────────────────────────────
+#  NEW — generate_query_embedding
+# ────────────────────────────────────────────────────────────
+def generate_query_embedding(text):
+    """
+    Convert a USER QUERY into a vector.
+
+    WHY separate from generate_embedding?
+    The nomic-embed-text model produces better results when you
+    prefix documents with "search_document:" and queries with
+    "search_query:". This small change improves retrieval accuracy.
+    """
+    try:
+        response = requests.post(
+            f"{OLLAMA_BASE_URL}/api/embeddings",
+            json={
+                "model": EMBEDDING_MODEL,
+                "prompt": f"search_query: {text}",
+            },
+            timeout=30,
+        )
+        response.raise_for_status()
+        return response.json().get("embedding")
+    except Exception as e:
+        logger.error(f"Query embedding failed: {e}")
+        return None
+
 
 
 def generate_response(prompt, model=LLM_MODEL, temperature=0.3, max_tokens=4096):
@@ -95,6 +133,35 @@ def generate_response(prompt, model=LLM_MODEL, temperature=0.3, max_tokens=4096)
 
 
 
+
+# ────────────────────────────────────────────────────────────
+#  NEW — score_relevance (for reranking)
+# ────────────────────────────────────────────────────────────
+def score_relevance(query, document_text):
+    """
+    Ask the LLM: "How relevant is this chunk to this query?"
+    Returns a float between 0.0 and 1.0.
+    Used by the reranker to pick the best chunks.
+    """
+    prompt = f"""Rate relevance of this document to the query.
+Reply with ONLY a number from 0 to 10.
+
+Query: {query}
+Document: {document_text[:400]}
+
+Score:"""
+
+    try:
+        resp = generate_response(prompt, temperature=0.0, max_tokens=10)
+        numbers = re.findall(r'(\d+(?:\.\d+)?)', resp)
+        if numbers:
+            return min(float(numbers[0]) / 10.0, 1.0)
+        return 0.5
+    except Exception:
+        return 0.5
+
+
+        
 
 # import requests
 # import json
